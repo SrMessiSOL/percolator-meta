@@ -6,6 +6,9 @@
 
 extern crate alloc;
 
+#[allow(unused_imports)]
+use alloc::format; // Required by entrypoint! macro in SBF builds
+
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     declare_id,

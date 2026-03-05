@@ -5,6 +5,8 @@ resolver = "2"
 [workspace.dependencies]
 solana-program = "1.18"
 spl-token = { version = "4.0", features = ["no-entrypoint"] }
+solana-sdk = "1.18"
+litesvm = "0.1"
 
 [profile.release]
 lto = "fat"

@@ -18,3 +18,8 @@ solana-program = { workspace = true }
 spl-token = { workspace = true }
 percolator-prog = { path = "../../percolator-prog", features = ["no-entrypoint"] }
 percolator = { path = "../../percolator" }
+
+[dev-dependencies]
+solana-sdk = { workspace = true }
+litesvm = { workspace = true }
+spl-token = { version = "4.0", features = ["no-entrypoint"] }
