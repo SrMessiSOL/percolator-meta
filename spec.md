@@ -1,4 +1,4 @@
-# spec.md — MetaDAO Futarchy → Percolator Market Factory + Deterministic Rewards
+# spec.md — MetaDAO Futarchy → Percolator Market Factory + Staking Vault Rewards
 
 look at ../percolator-prog for the program source and as the depencency
 
@@ -7,9 +7,9 @@ this is a pure solana rust program only.  it should use the same litesvm setup f
 ## Design constraints (MUST)
 
 1. No admin keys, no multisigs, no off-chain publishers.
-1. Everything “governance-like” is futarchy-gated by a MetaDAO proposal marked `executed=true`.
+1. Everything "governance-like" is futarchy-gated by a MetaDAO proposal marked `executed=true`.
 1. User funds are never at risk from futarchy itself: no futarchy-triggerable instruction may transfer, freeze, confiscate, or redirect user balances.
-1. The DAO may claim COIN rewards like any user, but cannot claim other users’ balances.
+1. The DAO may stake and claim COIN rewards like any user, but cannot claim other users' staked collateral.
 
 -----
 
@@ -17,12 +17,12 @@ this is a pure solana rust program only.  it should use the same litesvm setup f
 
 |Program                                      |Role                                                                             |
 |---------------------------------------------|---------------------------------------------------------------------------------|
-|`meta_dao` (existing)                        |Proposal lifecycle, futarchy voting, `executed` bit, contributor escrow, receipts|
+|`meta_dao` (existing)                        |Proposal lifecycle, futarchy voting, `executed` bit                              |
 |`percolator` (existing + two additions in §2)|Market creation, insurance vault, LP fee accounting                              |
-|`rewards` (new, ~200 lines, non-upgradeable) |COIN mint-authority PDA, owner-reward claims, LP-reward claims                   |
-|SPL Token Program                            |COIN mint and token accounts                                                     |
+|`rewards` (new, non-upgradeable)             |COIN mint-authority PDA, staking vault, stake/unstake, LP-reward claims           |
+|SPL Token Program                            |COIN mint, collateral token accounts, staking vault                              |
 
-There is no separate rewards-oracle, rewards-admin, or multisig program. The `rewards` program holds only a COIN mint-authority PDA derived from the market slab key; it has no privileged signer of its own.
+There is no separate rewards-oracle, rewards-admin, or multisig program. The `rewards` program holds only a COIN mint-authority PDA derived from the coin_mint key; it has no privileged signer of its own.
 
 -----
 
@@ -39,7 +39,7 @@ state::write_market_start_slot(data, clock.slot);   // new write in InitMarket
 state::read_market_start_slot(data) -> u64;          // new public reader
 ```
 
-This single u64 is the only anchor the `rewards` program needs to compute elapsed epochs. It is written once and never mutated. The `rewards` program reads it via the slab account data; it does not accept a caller-supplied start slot.
+This single u64 is the only anchor the `rewards` program needs to compute elapsed time. It is written once and never mutated. The `rewards` program reads it via the slab account data; it does not accept a caller-supplied start slot.
 
 ### 2.2 New `QueryLpFees` instruction (tag = 24)
 
@@ -51,60 +51,58 @@ Checks: slab initialized, `lp_idx` is a valid LP account (`check_idx`).
 
 Effect: Writes `fees_earned_total: u128` (16 bytes, little-endian) to Solana return-data via `set_return_data`. No state is mutated. No signer is required.
 
-The `rewards` program CPIs this instruction to obtain the monotonically non-decreasing cumulative fee total for an LP position. Exposing it as a versioned instruction — rather than requiring callers to parse internal slab offsets — makes the interface stable against future `RiskEngine` layout changes.
+The `rewards` program CPIs this instruction to obtain the monotonically non-decreasing cumulative fee total for an LP position.
 
 -----
 
 ## 3. Assets
 
-**SOL** — contributed by participants into a MetaDAO escrow, then seeded into the Percolator insurance vault at market creation.
+**Collateral** — SPL token deposited by stakers into a per-market staking vault. Each market has its own collateral mint and isolated vault.
 
-**COIN** — SPL token minted exclusively by the `rewards` program.
+**COIN** — SPL token minted exclusively by the `rewards` program. Shared across all markets managed by the same DAO.
 
 COIN mint requirements:
 
 - `mint_authority = PDA(rewards, [b"coin_mint_authority", coin_mint_key])`
 - `freeze_authority = None`
 - Decimals are fixed at creation and committed in the proposal hash.
-- A single COIN mint is shared across all markets managed by the same DAO. The `CoinConfig` PDA (§10) gates which authority can register new markets.
+- A single COIN mint is shared across all markets. The `CoinConfig` PDA (§10) gates which authority can register new markets.
 
 -----
 
 ## 4. Epoch
 
 ```
-EPOCH_SLOTS: u64          // constant compiled into the `rewards` program
-epoch(slot) = slot / EPOCH_SLOTS
+epoch_slots: u64          // per-market, set at init_market_rewards; immutable
 ```
+
+`epoch_slots` defines the minimum lockup period for stakers and the rate denominator for reward calculation. It is stored in `MarketRewardsCfg` and can differ per market (futarchy votes on it).
 
 -----
 
 ## 5. MetaDAO proposal payload
 
-A “Create Percolator Market” proposal commits to `market_config_hash = sha256(payload)` where `payload` is the canonical serialization of:
+A "Create Percolator Market" proposal commits to `market_config_hash = sha256(payload)` where `payload` is the canonical serialization of:
 
 - Full Percolator `MarketConfig` (passed verbatim to `InitMarket`)
-- `seed_sol_target: u64`
-- `N: u64` — COIN emitted per epoch to all insurance contributors collectively
+- `N: u64` — COIN emitted per epoch to stakers collectively
 - `K: u128` — COIN per fee-atom in fixed-point (`FP = 2^64`); see §8.2
-- `EPOCH_SLOTS` — must match the `rewards` program constant
+- `epoch_slots: u64` — minimum lockup / reward period
 - COIN mint address and decimals
+- Collateral mint address
 - Rounding rule: integer truncation with sub-coin remainder carried forward (§8)
 
 -----
 
-## 6. Escrow safety (MetaDAO)
+## 6. Staking vault
 
-Each proposal has a SOL escrow PDA:
+Each market has a per-market staking vault:
 
 ```
-seed_escrow = PDA(meta_dao, [b"escrow", proposal_key])
+stake_vault = PDA(rewards, [b"stake_vault", market_slab_key])
 ```
 
-Exactly two outcomes are permitted:
-
-- **Fail or cancel** — each contributor withdraws their own lamports via a signed receipt instruction. No other account can receive funds.
-- **Execute** — the entire escrow balance is transferred to the Percolator `insurance_vault` in the same atomic transaction as `InitMarket` (§7). No partial transfers, no intermediaries.
+The vault is an SPL token account whose authority is the MRC PDA. Users deposit collateral to earn COIN rewards. Each market is isolated: separate collateral, separate vault, separate reward rate.
 
 -----
 
@@ -113,11 +111,10 @@ Exactly two outcomes are permitted:
 The caller assembles the following instructions in a single transaction after `proposal.executed == true`:
 
 ```
-[0]  meta_dao::execute_and_create_market(proposal, market_config, N, K, coin_mint, coin_decimals)
+[0]  meta_dao::execute_and_create_market(proposal, market_config, N, K, epoch_slots, coin_mint)
        — verifies proposal.executed == true
-       — verifies sha256(market_config, N, K, coin_mint, coin_decimals, EPOCH_SLOTS)
+       — verifies sha256(market_config, N, K, epoch_slots, coin_mint, collateral_mint)
                  == proposal.market_config_hash
-       — verifies seed_escrow.lamports == proposal.seed_sol_raised
 
 [1]  percolator::InitMarket(
            admin           = seed_escrow_pda,    // temporary; burned in [3]
@@ -130,21 +127,19 @@ The caller assembles the following instructions in a single transaction after `p
      // lamports: seed_escrow_pda → percolator insurance_vault
 
 [3]  percolator::UpdateAdmin(new_admin = Pubkey::default())
-     // signer: seed_escrow_pda (CPI with PDA seeds)
      // admin is now [0u8;32]; percolator::require_admin permanently rejects all-zeros
      // all admin instructions on this market are disabled forever
 
 [4]  rewards::init_market_rewards(
-           market_slab, N, K, coin_mint,
-           total_contributed_lamports = proposal.seed_sol_raised
+           market_slab, N, K, epoch_slots, coin_mint, collateral_mint
      )
      // signer: CoinConfig.authority (the DAO)
      // creates MarketRewardsCfg PDA (init guard — fails if already exists)
+     // creates stake_vault SPL token account PDA
      // reads and stores market_start_slot from slab (never trusts caller-supplied value)
-     // receipt_program is copied from CoinConfig
 ```
 
-After instruction [3], Percolator’s `require_admin` check (`admin != [0u8;32]`) permanently rejects every admin instruction on this slab. No future governance call, upgrade, or multisig can invoke `UpdateConfig`, `SetRiskThreshold`, `ResolveMarket`, `WithdrawInsurance`, or any other admin-gated instruction on this market.
+After instruction [3], Percolator's `require_admin` check (`admin != [0u8;32]`) permanently rejects every admin instruction on this slab.
 
 -----
 
@@ -156,32 +151,45 @@ After instruction [3], Percolator’s `require_admin` check (`admin != [0u8;32]`
 FP = 2^64
 ```
 
-### 8.2 Owner rewards — receipt-proportional, no accumulator
+### 8.2 Staker rewards — Synthetix-style accumulator
 
-Because insurance contributions are one-time and fixed at market creation, the standard LP-share accumulator is unnecessary. Each contributor’s entitlement is fully determined by immutable quantities:
+Per market, `MarketRewardsCfg` maintains:
+
+- `reward_per_token_stored: u128` — global accumulator (FP-scaled)
+- `last_update_slot: u64`
+- `total_staked: u64`
+
+On every stake/unstake/claim, the accumulator is updated:
 
 ```
-epochs_elapsed  = epoch(current_slot) - epoch(market_start_slot)
-total_entitled  = N × epochs_elapsed × receipt.contributed_lamports
-                  / total_contributed_lamports          // integer division, truncates
-claimable       = total_entitled - claim_state.coin_claimed
+elapsed = current_slot - last_update_slot
+if total_staked > 0 and elapsed > 0:
+    delta = N * elapsed * FP / (epoch_slots * total_staked)   // u256 intermediate
+    reward_per_token_stored += delta
+last_update_slot = current_slot
 ```
 
-All inputs are on-chain with no Percolator changes beyond §2.1:
+Per user, `StakePosition` maintains:
 
-- `N` and `total_contributed_lamports` — stored in `MarketRewardsCfg`
-- `market_start_slot` — read from slab via `read_market_start_slot`
-- `receipt.contributed_lamports` — stored in MetaDAO receipt account
-- `claim_state.coin_claimed` — stored in `OwnerClaimState` PDA
+- `amount: u64`
+- `deposit_slot: u64`
+- `reward_per_token_paid: u128`
+- `pending_rewards: u64`
 
-Rounding: integer truncation means a contributor’s share accumulates one COIN at a time. The fractional remainder is never lost; it becomes claimable in a subsequent epoch once `total_entitled` crosses the next integer.
+On settle (before any stake/unstake):
 
-**Instruction:** `rewards::claim_owner_rewards(market_slab, proposal, receipt, claim_state, coin_ata)`
+```
+delta = reward_per_token_stored - reward_per_token_paid
+earned = amount * delta / FP
+pending_rewards += earned
+reward_per_token_paid = reward_per_token_stored
+```
 
-- Signer must be `receipt.contributor`.
-- Mints `claimable` COIN to `coin_ata`.
-- Sets `claim_state.coin_claimed += claimable`.
-- No Percolator CPI required.
+**Instruction:** `rewards::stake(amount)` — deposits collateral to vault, creates/updates position, resets lockup.
+
+**Instruction:** `rewards::unstake(amount)` — requires `current_slot >= deposit_slot + epoch_slots`, transfers collateral back, mints pending COIN, closes position on full unstake.
+
+**Instruction:** `rewards::claim_stake_rewards()` — mints pending COIN without unstaking. No lockup check required.
 
 ### 8.3 LP rewards — fee-multiple via QueryLpFees
 
@@ -201,24 +209,22 @@ lp_claim_state.reward_claimed_fp += (u256) claimable_coins × FP
 // sub-coin remainder stays claimable in future calls; nothing is dropped
 ```
 
-**Instruction:** `rewards::claim_lp_rewards(market_slab, lp_idx, lp_claim_state, coin_ata)`
+**Instruction:** `rewards::claim_lp_rewards(lp_idx)`
 
-- Signer must be the LP position’s registered owner (read from slab data).
+- Signer must be the LP position's registered owner (read from slab data).
 - CPIs `percolator::QueryLpFees` to read `fees_earned_total`.
 - Mints `claimable_coins` COIN to `coin_ata`.
 - `lp_claim_state.reward_claimed_fp` is monotonically non-decreasing; claim can never exceed entitlement.
 
 -----
 
-## 9. Contributor seed share redemption
+## 9. Staking lockup and withdrawal
 
-The seed SOL lives in the Percolator `insurance_vault` and is subject to the risk engine’s normal loss-socialization rules. Contributors hold a proportional implicit claim on vault residual:
+Stakers must hold collateral for at least `epoch_slots` after their last deposit before unstaking. Each new stake resets the lockup timer (`deposit_slot = current_slot`).
 
-```
-contributor_i share = receipt_i.contributed_lamports / total_contributed_lamports
-```
+Claiming COIN rewards (`claim_stake_rewards`) does NOT require lockup to elapse — stakers can harvest COIN at any time.
 
-Because the admin is burned in §7 step [3], `ResolveMarket` and `WithdrawInsurance` are permanently inaccessible on this market. If limited insurance withdrawal is desired, a `SetInsuranceWithdrawPolicy` authority must be configured **before** step [3] in the creation transaction. This is an optional extension; the core COIN reward flow does not require it.
+On full unstake (amount == staked balance), the StakePosition PDA is closed and rent is returned to the user.
 
 -----
 
@@ -233,29 +239,34 @@ Created once per COIN token via `init_coin_config`. The authority (typically the
 |Field             |Type  |Description                                     |
 |------------------|------|-------------------------------------------------|
 |`authority`       |Pubkey|Who can call `init_market_rewards` for this COIN |
-|`receipt_program` |Pubkey|MetaDAO program that owns receipt accounts       |
 
 ### MarketRewardsCfg
 
 PDA seeds: `[b"mrc", market_slab_key]`
 
-|Field                       |Type  |Description                                   |
-|----------------------------|------|----------------------------------------------|
-|`market_slab`               |Pubkey|Percolator slab account                       |
-|`coin_mint`                 |Pubkey|COIN mint address                             |
-|`receipt_program`           |Pubkey|Copied from CoinConfig at init time           |
-|`N`                         |u64   |Owner emission per epoch (COIN)               |
-|`K`                         |u128  |LP COIN per fee-atom (FP)                     |
-|`market_start_slot`         |u64   |Read from slab at init; immutable             |
-|`total_contributed_lamports`|u64   |From proposal; immutable                      |
+|Field                       |Type  |Description                                          |
+|----------------------------|------|-----------------------------------------------------|
+|`market_slab`               |Pubkey|Percolator slab account                              |
+|`coin_mint`                 |Pubkey|COIN mint address                                    |
+|`collateral_mint`           |Pubkey|Collateral token for this market's staking vault     |
+|`n_per_epoch`               |u64   |COIN emitted per epoch to stakers                    |
+|`K`                         |u128  |LP COIN per fee-atom (FP)                            |
+|`epoch_slots`               |u64   |Minimum lockup / reward period (slots)               |
+|`market_start_slot`         |u64   |Read from slab at init; immutable                    |
+|`reward_per_token_stored`   |u128  |Synthetix-style accumulator (FP-scaled)              |
+|`last_update_slot`          |u64   |Last slot accumulator was updated                    |
+|`total_staked`              |u64   |Total collateral currently staked                    |
 
-### OwnerClaimState
+### StakePosition
 
-PDA seeds: `[b"ocs", market_slab_key, receipt_key]`
+PDA seeds: `[b"sp", market_slab_key, user_pubkey]`
 
-|Field         |Type|Description                               |
-|--------------|----|------------------------------------------|
-|`coin_claimed`|u64 |Cumulative COIN minted to this contributor|
+|Field                    |Type |Description                                       |
+|-------------------------|-----|--------------------------------------------------|
+|`amount`                 |u64  |Collateral currently staked                       |
+|`deposit_slot`           |u64  |Slot of last deposit (lockup reference)           |
+|`reward_per_token_paid`  |u128 |Accumulator snapshot at last settle               |
+|`pending_rewards`        |u64  |Unsettled COIN rewards                            |
 
 ### LpClaimState
 
@@ -272,10 +283,11 @@ PDA seeds: `[b"lcs", market_slab_key, lp_idx_le_bytes]`
 No instruction in MetaDAO, Percolator, or `rewards` may:
 
 - Transfer tokens from arbitrary user accounts.
-- Withdraw SOL from the Percolator `insurance_vault` except via Percolator’s existing, non-governance risk-engine rules.
+- Withdraw collateral from the staking vault except to the user who staked it (via `unstake`).
+- Withdraw SOL from the Percolator `insurance_vault` except via Percolator's existing, non-governance risk-engine rules.
 - Freeze user token accounts.
 - Set or change the COIN mint freeze authority (must remain `None`).
-- Modify any reward parameter (`N`, `K`, `coin_mint`, `EPOCH_SLOTS`) after `init_market_rewards` is called.
+- Modify any reward parameter (`N`, `K`, `epoch_slots`, `coin_mint`) after `init_market_rewards` is called.
 - Invoke any Percolator admin instruction on a market whose admin has been burned.
 
 -----
@@ -284,20 +296,24 @@ No instruction in MetaDAO, Percolator, or `rewards` may:
 
 - `SlabHeader._reserved[8..16]` is currently zero-initialized and not written by any Percolator instruction at market-creation time. For markets created through this flow, `write_market_start_slot` takes ownership of those bytes at `InitMarket`. Existing markets have `0` there and are incompatible with this spec.
 - `fees_earned_total` inside the `RiskEngine` is monotonically non-decreasing. The `rewards` program assumes fees are never credited negatively.
-- LP wash-trading to inflate `fees_earned_total` is an economic risk, not a custody risk. It is bounded by `MAX_LP_COIN_PER_FEE_FP` and Percolator’s `trading_fee_bps`.
+- LP wash-trading to inflate `fees_earned_total` is an economic risk, not a custody risk. It is bounded by `MAX_LP_COIN_PER_FEE_FP` and Percolator's `trading_fee_bps`.
 - The `rewards` program is deployed non-upgradeable. The COIN mint `freeze_authority` is `None` at creation and cannot be set afterward.
 - `QueryLpFees` (§2.2) performs no state mutation and cannot be used to drain funds or bypass engine authorization.
+- Integer truncation in the Synthetix accumulator may cause up to 1 COIN per claim to be deferred. The sub-coin remainder is never lost; it becomes claimable as the accumulator advances.
 
 -----
 
 ## 13. Audit checklist
 
 - [ ] `InitMarket` sets `admin = seed_escrow_pda`; `UpdateAdmin(zeros)` is called in the same transaction before any other instruction can exercise that admin authority.
-- [ ] `seed_escrow` lamports flow only to `insurance_vault` (on execute) or back to contributors (on cancel/fail). No other disbursement path exists.
 - [ ] `rewards::init_market_rewards` creates `MarketRewardsCfg` with an init guard; a second call on the same slab fails.
 - [ ] `market_start_slot` is read from the slab by the `rewards` program; it is not accepted as an instruction argument.
-- [ ] Owner reward claim is bounded: for all contributors combined, total claimable ≤ `N × epochs_elapsed`. No single contributor can claim more than their `contributed_lamports / total_contributed_lamports` fraction.
+- [ ] Staker reward accumulator update is serialized to MRC before any CPI, preventing double-accumulation.
+- [ ] Staker collateral can only be withdrawn by the depositor, after lockup elapses, to their own token account.
+- [ ] For all stakers combined: total claimable per slot ≤ `N / epoch_slots`. No single staker can claim more than their `amount / total_staked` fraction.
 - [ ] LP reward claim satisfies `reward_claimed_fp ≤ fees_earned_total × K` at all times; sub-coin remainder accumulates and is never dropped.
 - [ ] `QueryLpFees` mutates no state; `check_idx` is the only guard required.
 - [ ] COIN mint `freeze_authority = None`; `rewards` program is non-upgradeable at deploy.
 - [ ] After admin burn: `UpdateConfig`, `SetRiskThreshold`, `SetOracleAuthority`, `ResolveMarket`, `WithdrawInsurance`, `SetMaintenanceFee`, `AdminForceCloseAccount`, and `CloseSlab` all fail on this market.
+- [ ] `CoinConfig.authority` is the only key that can register new markets for a given COIN; unauthorized callers are rejected.
+- [ ] Stake vault PDA authority is the MRC PDA; only `unstake` can transfer collateral out.
