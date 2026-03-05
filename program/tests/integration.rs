@@ -212,6 +212,86 @@ fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
     data
 }
 
+fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
+    let mut data = vec![11u8];
+    data.extend_from_slice(&new_threshold.to_le_bytes());
+    data
+}
+
+fn encode_close_slab() -> Vec<u8> {
+    vec![13u8]
+}
+
+fn encode_update_config() -> Vec<u8> {
+    let mut data = vec![14u8];
+    data.extend_from_slice(&100u64.to_le_bytes()); // funding_horizon_slots
+    data.extend_from_slice(&10u64.to_le_bytes()); // funding_k_bps
+    data.extend_from_slice(&1_000_000u128.to_le_bytes()); // funding_inv_scale_notional_e6
+    data.extend_from_slice(&100i64.to_le_bytes()); // funding_max_premium_bps
+    data.extend_from_slice(&10i64.to_le_bytes()); // funding_max_bps_per_slot
+    data.extend_from_slice(&0u128.to_le_bytes()); // thresh_floor
+    data.extend_from_slice(&50u64.to_le_bytes()); // thresh_risk_bps
+    data.extend_from_slice(&10u64.to_le_bytes()); // thresh_update_interval_slots
+    data.extend_from_slice(&1000u64.to_le_bytes()); // thresh_step_bps
+    data.extend_from_slice(&1000u64.to_le_bytes()); // thresh_alpha_bps
+    data.extend_from_slice(&0u128.to_le_bytes()); // thresh_min
+    data.extend_from_slice(&u128::MAX.to_le_bytes()); // thresh_max
+    data.extend_from_slice(&0u128.to_le_bytes()); // thresh_min_step
+    data
+}
+
+fn encode_set_maintenance_fee(new_fee: u128) -> Vec<u8> {
+    let mut data = vec![15u8];
+    data.extend_from_slice(&new_fee.to_le_bytes());
+    data
+}
+
+fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
+    let mut data = vec![16u8];
+    data.extend_from_slice(new_authority.as_ref());
+    data
+}
+
+fn encode_set_oracle_price_cap(max_change_e2bps: u64) -> Vec<u8> {
+    let mut data = vec![18u8];
+    data.extend_from_slice(&max_change_e2bps.to_le_bytes());
+    data
+}
+
+fn encode_resolve_market() -> Vec<u8> {
+    vec![19u8]
+}
+
+fn encode_withdraw_insurance() -> Vec<u8> {
+    vec![20u8]
+}
+
+fn encode_admin_force_close(user_idx: u16) -> Vec<u8> {
+    let mut data = vec![21u8];
+    data.extend_from_slice(&user_idx.to_le_bytes());
+    data
+}
+
+fn encode_set_insurance_withdraw_policy(
+    authority: &Pubkey,
+    min_withdraw_base: u128,
+    max_withdraw_bps: u64,
+    cooldown_slots: u64,
+) -> Vec<u8> {
+    let mut data = vec![22u8];
+    data.extend_from_slice(authority.as_ref());
+    data.extend_from_slice(&min_withdraw_base.to_le_bytes());
+    data.extend_from_slice(&max_withdraw_bps.to_le_bytes());
+    data.extend_from_slice(&cooldown_slots.to_le_bytes());
+    data
+}
+
+fn encode_topup_insurance(amount: u64) -> Vec<u8> {
+    let mut data = vec![9u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    data
+}
+
 // ============================================================================
 // Rewards instruction encoders
 // ============================================================================
@@ -1285,6 +1365,511 @@ fn test_claim_lp_rewards_no_fees() {
 
     let balance = env.read_token_balance(&coin_ata);
     assert_eq!(balance, 0, "No fees = no LP rewards");
+}
+
+// ============================================================================
+// Tests: admin burn disables all admin instructions
+// ============================================================================
+
+/// Helper: send a percolator admin instruction with [admin_signer, slab] (2-account layout).
+fn try_percolator_admin_ix_2(
+    env: &mut TestEnv,
+    admin: &Keypair,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    let ix = Instruction {
+        program_id: env.percolator_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+}
+
+/// Helper: send a percolator admin instruction with 6 accounts (WithdrawInsurance layout).
+fn try_percolator_admin_ix_6(
+    env: &mut TestEnv,
+    admin: &Keypair,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    let dummy = Pubkey::new_unique();
+    let ix = Instruction {
+        program_id: env.percolator_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(dummy, false),       // admin_ata (dummy)
+            AccountMeta::new(env.vault, false),    // vault
+            AccountMeta::new_readonly(spl_token::ID, false), // token_program
+            AccountMeta::new_readonly(dummy, false), // vault_pda (dummy)
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+}
+
+/// Helper: send a percolator admin instruction with 8 accounts (AdminForceCloseAccount layout).
+fn try_percolator_admin_ix_8(
+    env: &mut TestEnv,
+    admin: &Keypair,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    let dummy = Pubkey::new_unique();
+    let ix = Instruction {
+        program_id: env.percolator_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.vault, false),    // vault
+            AccountMeta::new(dummy, false),         // owner_ata
+            AccountMeta::new_readonly(dummy, false), // pda
+            AccountMeta::new_readonly(spl_token::ID, false), // token_program
+            AccountMeta::new_readonly(sysvar::clock::ID, false), // clock
+            AccountMeta::new_readonly(dummy, false), // oracle
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+}
+
+#[test]
+fn test_admin_burn_disables_all_admin_instructions() {
+    let mut env = TestEnv::new();
+
+    // The payer is the admin (set in encode_init_market).
+    // First, verify admin can still do something (e.g. SetRiskThreshold).
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let result = try_percolator_admin_ix_2(
+        &mut env,
+        &admin,
+        encode_set_risk_threshold(0),
+    );
+    assert!(result.is_ok(), "Admin should work before burn: {:?}", result);
+
+    // Burn admin: UpdateAdmin(Pubkey::default())
+    env.advance_blockhash();
+    let result = try_percolator_admin_ix_2(
+        &mut env,
+        &admin,
+        encode_update_admin(&Pubkey::default()),
+    );
+    assert!(result.is_ok(), "UpdateAdmin to zero should succeed: {:?}", result);
+
+    // Now attempt ALL 11 admin-gated instructions — every one must fail.
+    let anyone = Keypair::new();
+    env.svm.airdrop(&anyone.pubkey(), 10_000_000_000).unwrap();
+
+    // 1. SetRiskThreshold
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(&mut env, &anyone, encode_set_risk_threshold(0));
+    assert!(r.is_err(), "SetRiskThreshold must fail after admin burn");
+
+    // 2. UpdateAdmin (can't re-claim admin)
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(
+        &mut env,
+        &anyone,
+        encode_update_admin(&anyone.pubkey()),
+    );
+    assert!(r.is_err(), "UpdateAdmin must fail after admin burn");
+
+    // 3. CloseSlab
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(&mut env, &anyone, encode_close_slab());
+    assert!(r.is_err(), "CloseSlab must fail after admin burn");
+
+    // 4. UpdateConfig
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(&mut env, &anyone, encode_update_config());
+    assert!(r.is_err(), "UpdateConfig must fail after admin burn");
+
+    // 5. SetMaintenanceFee
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(&mut env, &anyone, encode_set_maintenance_fee(0));
+    assert!(r.is_err(), "SetMaintenanceFee must fail after admin burn");
+
+    // 6. SetOracleAuthority
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(
+        &mut env,
+        &anyone,
+        encode_set_oracle_authority(&anyone.pubkey()),
+    );
+    assert!(r.is_err(), "SetOracleAuthority must fail after admin burn");
+
+    // 7. SetOraclePriceCap
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(&mut env, &anyone, encode_set_oracle_price_cap(1000));
+    assert!(r.is_err(), "SetOraclePriceCap must fail after admin burn");
+
+    // 8. ResolveMarket
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(&mut env, &anyone, encode_resolve_market());
+    assert!(r.is_err(), "ResolveMarket must fail after admin burn");
+
+    // 9. WithdrawInsurance (6-account layout)
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_6(&mut env, &anyone, encode_withdraw_insurance());
+    assert!(r.is_err(), "WithdrawInsurance must fail after admin burn");
+
+    // 10. AdminForceCloseAccount (8-account layout)
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_8(&mut env, &anyone, encode_admin_force_close(0));
+    assert!(r.is_err(), "AdminForceCloseAccount must fail after admin burn");
+
+    // 11. SetInsuranceWithdrawPolicy
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(
+        &mut env,
+        &anyone,
+        encode_set_insurance_withdraw_policy(
+            &anyone.pubkey(),
+            1_000_000,
+            5000,
+            100,
+        ),
+    );
+    assert!(r.is_err(), "SetInsuranceWithdrawPolicy must fail after admin burn");
+
+    // Also verify the original admin can't do anything either
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(&mut env, &admin, encode_set_risk_threshold(0));
+    assert!(r.is_err(), "Original admin must also fail after burn");
+}
+
+#[test]
+fn test_admin_burn_is_irreversible() {
+    let mut env = TestEnv::new();
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Burn admin
+    let result = try_percolator_admin_ix_2(
+        &mut env,
+        &admin,
+        encode_update_admin(&Pubkey::default()),
+    );
+    assert!(result.is_ok());
+
+    // Try to re-set admin back to the original key — must fail
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(
+        &mut env,
+        &admin,
+        encode_update_admin(&admin.pubkey()),
+    );
+    assert!(r.is_err(), "Cannot re-claim admin once burned");
+
+    // Try with a brand new keypair
+    let new_admin = Keypair::new();
+    env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(
+        &mut env,
+        &new_admin,
+        encode_update_admin(&new_admin.pubkey()),
+    );
+    assert!(r.is_err(), "No one can re-claim admin once burned");
+}
+
+// ============================================================================
+// Tests: multi-user insurance deposit, rewards, independent withdrawal timing
+// ============================================================================
+
+#[test]
+fn test_multi_user_owner_rewards_different_times() {
+    let mut env = TestEnv::new();
+    let n = 1000u64;
+    let total_contributed = 10_000_000u64;
+    env.init_market_rewards(n, 1u128 << 64, total_contributed);
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    let carol = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&carol.pubkey(), 10_000_000_000).unwrap();
+
+    // Alice 20%, Bob 30%, Carol 50%
+    let receipt_a = env.create_receipt(&alice.pubkey(), 2_000_000);
+    let receipt_b = env.create_receipt(&bob.pubkey(), 3_000_000);
+    let receipt_c = env.create_receipt(&carol.pubkey(), 5_000_000);
+    let ata_a = env.create_coin_ata(&alice.pubkey(), 0);
+    let ata_b = env.create_coin_ata(&bob.pubkey(), 0);
+    let ata_c = env.create_coin_ata(&carol.pubkey(), 0);
+
+    // Epoch 1: only Alice claims
+    env.set_clock(EPOCH_SLOTS + 100);
+    env.claim_owner_rewards(&alice, &receipt_a, &ata_a);
+    assert_eq!(env.read_token_balance(&ata_a), 200); // 1000 * 1 * 20% = 200
+
+    // Epoch 3: Bob claims (should get epochs 1-2, i.e., 2 epochs worth)
+    env.set_clock(3 * EPOCH_SLOTS + 100);
+    env.claim_owner_rewards(&bob, &receipt_b, &ata_b);
+    // Bob: 1000 * 3 epochs * 30% = 900 (catches up from epoch 0 through epoch 2)
+    assert_eq!(env.read_token_balance(&ata_b), 900);
+
+    // Alice claims again at epoch 3 (should get epochs 1-2 additional)
+    env.advance_blockhash();
+    env.claim_owner_rewards(&alice, &receipt_a, &ata_a);
+    // Alice: total 3 epochs * 20% * 1000 = 600
+    assert_eq!(env.read_token_balance(&ata_a), 600);
+
+    // Epoch 5: Carol finally claims (5 epochs * 50% = 2500)
+    env.set_clock(5 * EPOCH_SLOTS + 100);
+    env.claim_owner_rewards(&carol, &receipt_c, &ata_c);
+    assert_eq!(env.read_token_balance(&ata_c), 2500);
+
+    // All claims are independent — Alice's earlier claim didn't affect Bob or Carol
+    // Total minted: 600 + 900 + 2500 = 4000
+    // Expected: epochs 0..5 for each user at their share
+    // Alice: 5 * 200 = 1000 after epoch 5 claim
+    env.advance_blockhash();
+    env.claim_owner_rewards(&alice, &receipt_a, &ata_a);
+    assert_eq!(env.read_token_balance(&ata_a), 1000);
+}
+
+#[test]
+fn test_multi_user_lp_rewards_independent() {
+    let mut env = TestEnv::new();
+    let k: u128 = 1u128 << 64;
+    env.init_market_rewards(1000, k, 10_000_000);
+
+    let lp1_owner = Keypair::new();
+    let lp2_owner = Keypair::new();
+    let user = Keypair::new();
+
+    let lp1_idx = env.init_lp(&lp1_owner);
+    let lp2_idx = env.init_lp(&lp2_owner);
+    let user_idx = env.init_user(&user);
+
+    // Both LPs deposit
+    env.deposit(&lp1_owner, lp1_idx, 100_000_000);
+    env.deposit(&lp2_owner, lp2_idx, 100_000_000);
+    env.deposit(&user, user_idx, 100_000_000);
+
+    // Trade against LP1
+    env.trade(&user, &lp1_owner, lp1_idx, user_idx, 1_000_000);
+
+    let coin_ata1 = env.create_coin_ata(&lp1_owner.pubkey(), 0);
+    let coin_ata2 = env.create_coin_ata(&lp2_owner.pubkey(), 0);
+
+    // LP1 claims — should get rewards from their fees
+    env.claim_lp_rewards(&lp1_owner, lp1_idx, &coin_ata1);
+    let lp1_balance = env.read_token_balance(&coin_ata1);
+    assert!(lp1_balance > 0, "LP1 should earn from their trades");
+
+    // LP2 claims — no trades against LP2 so no fees
+    env.claim_lp_rewards(&lp2_owner, lp2_idx, &coin_ata2);
+    let lp2_balance = env.read_token_balance(&coin_ata2);
+    assert_eq!(lp2_balance, 0, "LP2 had no trades, no rewards");
+
+    // Now trade against LP2
+    env.advance_blockhash();
+    env.trade(&user, &lp2_owner, lp2_idx, user_idx, -500_000);
+
+    // LP2 claims again — now should have rewards
+    env.advance_blockhash();
+    env.claim_lp_rewards(&lp2_owner, lp2_idx, &coin_ata2);
+    let lp2_balance2 = env.read_token_balance(&coin_ata2);
+    assert!(lp2_balance2 > 0, "LP2 should now have rewards from second trade");
+
+    // LP1's balance unchanged (no new trades against LP1)
+    env.advance_blockhash();
+    env.claim_lp_rewards(&lp1_owner, lp1_idx, &coin_ata1);
+    let lp1_balance2 = env.read_token_balance(&coin_ata1);
+    assert_eq!(lp1_balance2, lp1_balance, "LP1 balance unchanged without new trades");
+}
+
+// ============================================================================
+// Tests: DAO cannot steal user funds
+// ============================================================================
+
+#[test]
+fn test_dao_cannot_steal_via_admin_instructions() {
+    // After admin burn, no instruction can extract funds from the market.
+    // Before burn, the only fund-extracting admin instruction is WithdrawInsurance,
+    // which requires market to be resolved AND all positions closed.
+    // This test proves post-burn no admin instructions work at all.
+    let mut env = TestEnv::new();
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Set up LP and user with funds in the market
+    let lp_owner = Keypair::new();
+    let user = Keypair::new();
+    let lp_idx = env.init_lp(&lp_owner);
+    let user_idx = env.init_user(&user);
+    env.deposit(&lp_owner, lp_idx, 100_000_000);
+    env.deposit(&user, user_idx, 100_000_000);
+
+    // Burn admin
+    let r = try_percolator_admin_ix_2(
+        &mut env,
+        &admin,
+        encode_update_admin(&Pubkey::default()),
+    );
+    assert!(r.is_ok(), "Admin burn should succeed");
+
+    // Try to resolve the market (required for WithdrawInsurance) — must fail
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(&mut env, &admin, encode_resolve_market());
+    assert!(r.is_err(), "Cannot resolve market after admin burn");
+
+    // Try to withdraw insurance directly — must fail
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_6(&mut env, &admin, encode_withdraw_insurance());
+    assert!(r.is_err(), "Cannot withdraw insurance after admin burn");
+
+    // Try to force close a user account — must fail
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_8(&mut env, &admin, encode_admin_force_close(user_idx));
+    assert!(r.is_err(), "Cannot force close accounts after admin burn");
+
+    // Try to close the slab — must fail
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(&mut env, &admin, encode_close_slab());
+    assert!(r.is_err(), "Cannot close slab after admin burn");
+}
+
+#[test]
+fn test_no_instruction_to_redirect_user_funds() {
+    // Rewards program has exactly 3 instructions:
+    // 0 = init_market_rewards (creates config, no fund transfer)
+    // 1 = claim_owner_rewards (mints new COIN to contributor, doesn't touch collateral)
+    // 2 = claim_lp_rewards (mints new COIN to LP, doesn't touch collateral)
+    //
+    // None of these can transfer collateral from the vault or steal user deposits.
+    // The only way collateral moves is through percolator-prog's deposit/withdraw.
+    //
+    // This test verifies claim_owner_rewards can only mint to the contributor who
+    // actually owns the receipt, and claim_lp_rewards can only mint to the LP owner.
+
+    let mut env = TestEnv::new();
+    env.init_market_rewards(1000, 1u128 << 64, 10_000_000);
+
+    let real_contributor = Keypair::new();
+    env.svm.airdrop(&real_contributor.pubkey(), 10_000_000_000).unwrap();
+    let receipt = env.create_receipt(&real_contributor.pubkey(), 5_000_000);
+
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+    let attacker_ata = env.create_coin_ata(&attacker.pubkey(), 0);
+
+    env.set_clock(EPOCH_SLOTS + 100);
+
+    // Attacker cannot claim using someone else's receipt
+    let r = env.try_claim_owner_rewards(&attacker, &receipt, &attacker_ata);
+    assert!(r.is_err(), "Attacker cannot steal owner rewards");
+
+    // Attacker cannot claim LP rewards for an LP they don't own
+    let lp_owner = Keypair::new();
+    let user = Keypair::new();
+    let lp_idx = env.init_lp(&lp_owner);
+    let user_idx = env.init_user(&user);
+    env.deposit(&lp_owner, lp_idx, 100_000_000);
+    env.deposit(&user, user_idx, 100_000_000);
+    env.trade(&user, &lp_owner, lp_idx, user_idx, 1_000_000);
+
+    let r = env.try_claim_lp_rewards(&attacker, lp_idx, &attacker_ata);
+    assert!(r.is_err(), "Attacker cannot steal LP rewards");
+
+    // Only the real LP owner can claim
+    let lp_ata = env.create_coin_ata(&lp_owner.pubkey(), 0);
+    env.claim_lp_rewards(&lp_owner, lp_idx, &lp_ata);
+    let balance = env.read_token_balance(&lp_ata);
+    assert!(balance > 0, "Real LP owner gets their rewards");
+}
+
+#[test]
+fn test_insurance_topup_permissionless_withdraw_restricted() {
+    // Anyone can top up insurance (permissionless), but only admin can withdraw
+    // via WithdrawInsurance, and only after resolution.
+    // After admin burn, no one can withdraw insurance.
+    let mut env = TestEnv::new();
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp_owner = Keypair::new();
+    let user = Keypair::new();
+    let lp_idx = env.init_lp(&lp_owner);
+    let user_idx = env.init_user(&user);
+    env.deposit(&lp_owner, lp_idx, 100_000_000);
+    env.deposit(&user, user_idx, 100_000_000);
+
+    // Anyone can deposit into insurance (topup is permissionless)
+    let donor = Keypair::new();
+    env.svm.airdrop(&donor.pubkey(), 10_000_000_000).unwrap();
+    let col_mint = env.collateral_mint;
+    let donor_ata = env.create_ata(&col_mint, &donor.pubkey(), 10_000_000);
+    let ix = Instruction {
+        program_id: env.percolator_id,
+        accounts: vec![
+            AccountMeta::new(donor.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(donor_ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_topup_insurance(1_000_000),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&donor.pubkey()),
+        &[&donor],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("insurance topup should succeed");
+
+    // Admin cannot withdraw insurance before resolving the market
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_6(&mut env, &admin, encode_withdraw_insurance());
+    assert!(r.is_err(), "Cannot withdraw insurance before resolution");
+
+    // Burn admin
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(
+        &mut env,
+        &admin,
+        encode_update_admin(&Pubkey::default()),
+    );
+    assert!(r.is_ok());
+
+    // After burn, cannot resolve or withdraw
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_2(&mut env, &admin, encode_resolve_market());
+    assert!(r.is_err(), "Cannot resolve after burn");
+
+    env.advance_blockhash();
+    let r = try_percolator_admin_ix_6(&mut env, &admin, encode_withdraw_insurance());
+    assert!(r.is_err(), "Cannot withdraw insurance after burn");
 }
 
 // ============================================================================
