@@ -1,0 +1,13 @@
+[workspace]
+members = ["program"]
+resolver = "2"
+
+[workspace.dependencies]
+solana-program = "1.18"
+spl-token = { version = "4.0", features = ["no-entrypoint"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+overflow-checks = true

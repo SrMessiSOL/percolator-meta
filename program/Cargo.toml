@@ -1,0 +1,20 @@
+[package]
+name = "rewards-program"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "rewards_program"
+path = "src/lib.rs"
+
+[features]
+no-entrypoint = []
+test-sbf = []
+
+[dependencies]
+solana-program = { workspace = true }
+spl-token = { workspace = true }
+percolator-prog = { path = "../../percolator-prog", features = ["no-entrypoint"] }
+percolator = { path = "../../percolator" }
