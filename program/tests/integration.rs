@@ -288,10 +288,9 @@ fn encode_init_coin_config() -> Vec<u8> {
     vec![3u8] // tag = IX_INIT_COIN_CONFIG
 }
 
-fn encode_init_market_rewards(n: u64, k: u128, epoch_slots: u64) -> Vec<u8> {
+fn encode_init_market_rewards(n: u64, epoch_slots: u64) -> Vec<u8> {
     let mut data = vec![0u8]; // tag = IX_INIT_MARKET_REWARDS
     data.extend_from_slice(&n.to_le_bytes());
-    data.extend_from_slice(&k.to_le_bytes());
     data.extend_from_slice(&epoch_slots.to_le_bytes());
     data
 }
@@ -312,9 +311,9 @@ fn encode_claim_stake_rewards() -> Vec<u8> {
     vec![4u8] // tag = IX_CLAIM_STAKE_REWARDS
 }
 
-fn encode_claim_lp_rewards(lp_idx: u16) -> Vec<u8> {
-    let mut data = vec![5u8]; // tag = IX_CLAIM_LP_REWARDS
-    data.extend_from_slice(&lp_idx.to_le_bytes());
+fn encode_mint_reward(amount: u64) -> Vec<u8> {
+    let mut data = vec![5u8]; // tag = IX_MINT_REWARD
+    data.extend_from_slice(&amount.to_le_bytes());
     data
 }
 
@@ -339,10 +338,6 @@ struct TestEnv {
 
 impl TestEnv {
     fn new() -> Self {
-        Self::with_trading_fee(100) // 1% default trading fee for LP reward tests
-    }
-
-    fn with_trading_fee(trading_fee_bps: u64) -> Self {
         let mut svm = LiteSVM::new();
 
         let percolator_id = Pubkey::new_unique();
@@ -488,7 +483,7 @@ impl TestEnv {
                 &payer.pubkey(),
                 &collateral_mint,
                 &TEST_FEED_ID,
-                trading_fee_bps,
+                0, // trading_fee_bps
             ),
         };
         let tx = Transaction::new_signed_with_payer(
@@ -570,7 +565,7 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    fn init_market_rewards(&mut self, n: u64, k: u128, epoch_slots: u64) {
+    fn init_market_rewards(&mut self, n: u64, epoch_slots: u64) {
         let (mrc_pda, _) =
             Pubkey::find_program_address(&[b"mrc", self.slab.as_ref()], &self.rewards_id);
         let (coin_cfg_pda, _) = Pubkey::find_program_address(
@@ -596,7 +591,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(sysvar::rent::ID, false), // [8] rent
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false), // [9] system
             ],
-            data: encode_init_market_rewards(n, k, epoch_slots),
+            data: encode_init_market_rewards(n, epoch_slots),
         };
         let tx = Transaction::new_signed_with_payer(
             &[ix],
@@ -612,7 +607,6 @@ impl TestEnv {
     fn try_init_market_rewards(
         &mut self,
         n: u64,
-        k: u128,
         epoch_slots: u64,
     ) -> Result<(), String> {
         let (mrc_pda, _) =
@@ -639,7 +633,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
-            data: encode_init_market_rewards(n, k, epoch_slots),
+            data: encode_init_market_rewards(n, epoch_slots),
         };
         let tx = Transaction::new_signed_with_payer(
             &[ix],
@@ -996,76 +990,67 @@ impl TestEnv {
         self.svm.expire_blockhash();
     }
 
-    fn claim_lp_rewards(&mut self, lp_owner: &Keypair, lp_idx: u16, coin_ata: &Pubkey) {
-        let (mrc_pda, _) =
-            Pubkey::find_program_address(&[b"mrc", self.slab.as_ref()], &self.rewards_id);
-        let lp_idx_bytes = lp_idx.to_le_bytes();
-        let (lcs_pda, _) = Pubkey::find_program_address(
-            &[b"lcs", self.slab.as_ref(), &lp_idx_bytes],
+    fn mint_reward(&mut self, amount: u64, destination: &Pubkey) {
+        self.try_mint_reward(amount, destination).expect("mint_reward failed");
+    }
+
+    fn try_mint_reward(&mut self, amount: u64, destination: &Pubkey) -> Result<(), String> {
+        let (coin_cfg_pda, _) = Pubkey::find_program_address(
+            &[b"coin_cfg", self.coin_mint.as_ref()],
             &self.rewards_id,
         );
 
         let ix = Instruction {
             program_id: self.rewards_id,
             accounts: vec![
-                AccountMeta::new(lp_owner.pubkey(), true),
-                AccountMeta::new_readonly(mrc_pda, false),
-                AccountMeta::new_readonly(self.slab, false),
-                AccountMeta::new(lcs_pda, false),
-                AccountMeta::new(self.coin_mint, false),
-                AccountMeta::new(*coin_ata, false),
-                AccountMeta::new_readonly(self.mint_authority_pda, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(self.percolator_id, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(self.dao_authority.pubkey(), true),  // [0] authority
+                AccountMeta::new(self.coin_mint, false),              // [1] coin_mint
+                AccountMeta::new_readonly(coin_cfg_pda, false),       // [2] coin_config
+                AccountMeta::new(*destination, false),                // [3] destination
+                AccountMeta::new_readonly(self.mint_authority_pda, false), // [4] mint_authority
+                AccountMeta::new_readonly(spl_token::ID, false),      // [5] token_program
             ],
-            data: encode_claim_lp_rewards(lp_idx),
+            data: encode_mint_reward(amount),
         };
         let tx = Transaction::new_signed_with_payer(
             &[ix],
-            Some(&lp_owner.pubkey()),
-            &[lp_owner],
+            Some(&self.dao_authority.pubkey()),
+            &[&self.dao_authority],
             self.svm.latest_blockhash(),
         );
         self.svm
             .send_transaction(tx)
-            .expect("claim_lp_rewards failed");
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
     }
 
-    fn try_claim_lp_rewards(
+    fn try_mint_reward_with_signer(
         &mut self,
-        lp_owner: &Keypair,
-        lp_idx: u16,
-        coin_ata: &Pubkey,
+        signer: &Keypair,
+        amount: u64,
+        destination: &Pubkey,
     ) -> Result<(), String> {
-        let (mrc_pda, _) =
-            Pubkey::find_program_address(&[b"mrc", self.slab.as_ref()], &self.rewards_id);
-        let lp_idx_bytes = lp_idx.to_le_bytes();
-        let (lcs_pda, _) = Pubkey::find_program_address(
-            &[b"lcs", self.slab.as_ref(), &lp_idx_bytes],
+        let (coin_cfg_pda, _) = Pubkey::find_program_address(
+            &[b"coin_cfg", self.coin_mint.as_ref()],
             &self.rewards_id,
         );
 
         let ix = Instruction {
             program_id: self.rewards_id,
             accounts: vec![
-                AccountMeta::new(lp_owner.pubkey(), true),
-                AccountMeta::new_readonly(mrc_pda, false),
-                AccountMeta::new_readonly(self.slab, false),
-                AccountMeta::new(lcs_pda, false),
+                AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.coin_mint, false),
-                AccountMeta::new(*coin_ata, false),
+                AccountMeta::new_readonly(coin_cfg_pda, false),
+                AccountMeta::new(*destination, false),
                 AccountMeta::new_readonly(self.mint_authority_pda, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(self.percolator_id, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
-            data: encode_claim_lp_rewards(lp_idx),
+            data: encode_mint_reward(amount),
         };
         let tx = Transaction::new_signed_with_payer(
             &[ix],
-            Some(&lp_owner.pubkey()),
-            &[lp_owner],
+            Some(&signer.pubkey()),
+            &[signer],
             self.svm.latest_blockhash(),
         );
         self.svm
@@ -1191,18 +1176,17 @@ fn test_init_market_rewards_happy_path() {
     env.init_coin_config();
 
     let n = 1000u64;
-    let k = 1u128 << 64;
     let epoch_slots = 216_000u64;
 
-    env.init_market_rewards(n, k, epoch_slots);
+    env.init_market_rewards(n, epoch_slots);
 
     let (mrc_pda, _) =
         Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     let mrc_account = env.svm.get_account(&mrc_pda).unwrap();
     assert_eq!(mrc_account.owner, env.rewards_id);
-    assert_eq!(mrc_account.data.len(), 176); // MRC_SIZE
+    assert_eq!(mrc_account.data.len(), 160); // MRC_SIZE
 
-    assert_eq!(&mrc_account.data[..8], b"MRC_V002");
+    assert_eq!(&mrc_account.data[..8], b"MRC_V003");
 
     let stored_slab = Pubkey::new_from_array(mrc_account.data[8..40].try_into().unwrap());
     assert_eq!(stored_slab, env.slab);
@@ -1217,13 +1201,10 @@ fn test_init_market_rewards_happy_path() {
     let stored_n = u64::from_le_bytes(mrc_account.data[104..112].try_into().unwrap());
     assert_eq!(stored_n, n);
 
-    let stored_k = u128::from_le_bytes(mrc_account.data[112..128].try_into().unwrap());
-    assert_eq!(stored_k, k);
-
-    let stored_epoch_slots = u64::from_le_bytes(mrc_account.data[128..136].try_into().unwrap());
+    let stored_epoch_slots = u64::from_le_bytes(mrc_account.data[112..120].try_into().unwrap());
     assert_eq!(stored_epoch_slots, epoch_slots);
 
-    let stored_start = u64::from_le_bytes(mrc_account.data[136..144].try_into().unwrap());
+    let stored_start = u64::from_le_bytes(mrc_account.data[120..128].try_into().unwrap());
     assert_eq!(stored_start, 100); // clock was set to 100 during init
 
     // Verify stake vault was created
@@ -1243,35 +1224,18 @@ fn test_init_market_rewards_happy_path() {
 fn test_init_market_rewards_double_init_fails() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 1u128 << 64, 216_000);
+    env.init_market_rewards(1000, 216_000);
 
     env.advance_blockhash();
-    let result = env.try_init_market_rewards(1000, 1u128 << 64, 216_000);
+    let result = env.try_init_market_rewards(1000, 216_000);
     assert!(result.is_err(), "Double init should fail");
-}
-
-#[test]
-fn test_init_market_rewards_k_exceeds_max_fails() {
-    let mut env = TestEnv::new();
-    env.init_coin_config();
-    let max_k: u128 = 1_000_000u128 << 64;
-    let result = env.try_init_market_rewards(1000, max_k + 1, 216_000);
-    assert!(result.is_err(), "K > MAX_LP_COIN_PER_FEE_FP should fail");
-}
-
-#[test]
-fn test_init_market_rewards_k_at_max_succeeds() {
-    let mut env = TestEnv::new();
-    env.init_coin_config();
-    let max_k: u128 = 1_000_000u128 << 64;
-    env.init_market_rewards(1000, max_k, 216_000);
 }
 
 #[test]
 fn test_init_market_rewards_epoch_slots_zero_fails() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    let result = env.try_init_market_rewards(1000, 1u128 << 64, 0);
+    let result = env.try_init_market_rewards(1000, 0);
     assert!(result.is_err(), "epoch_slots = 0 should fail");
 }
 
@@ -1310,7 +1274,7 @@ fn test_init_market_rewards_wrong_authority_fails() {
             AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
-        data: encode_init_market_rewards(1000, 1u128 << 64, 216_000),
+        data: encode_init_market_rewards(1000, 216_000),
     };
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -1330,7 +1294,7 @@ fn test_init_market_rewards_wrong_authority_fails() {
 fn test_stake_happy_path() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100); // N=1000, K=0, epoch_slots=100
+    env.init_market_rewards(1000, 100); // N=1000, K=0, epoch_slots=100
 
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
@@ -1362,7 +1326,7 @@ fn test_stake_happy_path() {
     let (mrc_pda, _) =
         Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     let mrc_data = env.svm.get_account(&mrc_pda).unwrap();
-    let total_staked = u64::from_le_bytes(mrc_data.data[168..176].try_into().unwrap());
+    let total_staked = u64::from_le_bytes(mrc_data.data[152..160].try_into().unwrap());
     assert_eq!(total_staked, 1_000_000);
 }
 
@@ -1370,7 +1334,7 @@ fn test_stake_happy_path() {
 fn test_stake_zero_amount_fails() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
@@ -1383,7 +1347,7 @@ fn test_stake_zero_amount_fails() {
 fn test_stake_additional_resets_lockup() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
@@ -1417,7 +1381,7 @@ fn test_unstake_after_lockup() {
     let mut env = TestEnv::new();
     env.init_coin_config();
     let epoch_slots = 100u64;
-    env.init_market_rewards(1000, 0, epoch_slots); // N=1000/epoch
+    env.init_market_rewards(1000, epoch_slots); // N=1000/epoch
 
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
@@ -1444,7 +1408,7 @@ fn test_unstake_after_lockup() {
 fn test_unstake_before_lockup_fails() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
@@ -1462,7 +1426,7 @@ fn test_unstake_before_lockup_fails() {
 fn test_unstake_more_than_staked_fails() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
@@ -1479,7 +1443,7 @@ fn test_partial_unstake() {
     let mut env = TestEnv::new();
     env.init_coin_config();
     let epoch_slots = 100u64;
-    env.init_market_rewards(1000, 0, epoch_slots);
+    env.init_market_rewards(1000, epoch_slots);
 
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
@@ -1509,7 +1473,7 @@ fn test_partial_unstake() {
 fn test_full_unstake_closes_position() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
@@ -1540,7 +1504,7 @@ fn test_full_unstake_closes_position() {
 fn test_claim_stake_rewards_no_lockup_required() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
@@ -1560,7 +1524,7 @@ fn test_claim_stake_rewards_no_lockup_required() {
 fn test_claim_stake_rewards_multiple_times() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
@@ -1590,7 +1554,7 @@ fn test_claim_stake_rewards_multiple_times() {
 fn test_claim_stake_rewards_zero_at_start() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
@@ -1610,7 +1574,7 @@ fn test_claim_stake_rewards_zero_at_start() {
 fn test_two_users_equal_stake() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100); // N=1000/epoch, epoch_slots=100
+    env.init_market_rewards(1000, 100); // N=1000/epoch, epoch_slots=100
 
     let alice = Keypair::new();
     let bob = Keypair::new();
@@ -1640,7 +1604,7 @@ fn test_two_users_equal_stake() {
 fn test_two_users_different_amounts() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let alice = Keypair::new();
     let bob = Keypair::new();
@@ -1669,7 +1633,7 @@ fn test_two_users_different_amounts() {
 fn test_staker_joins_later() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let alice = Keypair::new();
     let bob = Keypair::new();
@@ -1704,7 +1668,7 @@ fn test_staker_joins_later() {
 fn test_staker_leaves_then_another_earns_all() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let alice = Keypair::new();
     let bob = Keypair::new();
@@ -1746,7 +1710,7 @@ fn test_two_users_unstake_at_different_times() {
     // Verify both collateral returns and COIN reward amounts.
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100); // N=1000/epoch, epoch_slots=100
+    env.init_market_rewards(1000, 100); // N=1000/epoch, epoch_slots=100
 
     let alice = Keypair::new();
     let bob = Keypair::new();
@@ -1788,7 +1752,7 @@ fn test_three_users_staggered_entry_and_exit() {
     // Rate = 12 COIN/slot when divided among stakers.
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1200, 0, 100);
+    env.init_market_rewards(1200, 100);
 
     let alice = Keypair::new();
     let bob = Keypair::new();
@@ -1848,7 +1812,7 @@ fn test_partial_unstake_then_full_unstake_different_users() {
     // Verify collateral and rewards at each step.
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(900, 0, 100); // 9 COIN/slot
+    env.init_market_rewards(900, 100); // 9 COIN/slot
 
     let alice = Keypair::new();
     let bob = Keypair::new();
@@ -1895,7 +1859,7 @@ fn test_claim_then_unstake_no_double_rewards() {
     // Total COIN should equal what she'd get by just unstaking at 300.
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let alice = Keypair::new();
     env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
@@ -1930,7 +1894,7 @@ fn test_user_leaves_mid_epoch_collateral_conserved() {
     // Alice stakes 2M, Bob stakes 1M. Alice unstakes 500K. Vault should have 2.5M.
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 0, 100);
+    env.init_market_rewards(1000, 100);
 
     let alice = Keypair::new();
     let bob = Keypair::new();
@@ -1962,121 +1926,62 @@ fn test_user_leaves_mid_epoch_collateral_conserved() {
 }
 
 // ============================================================================
-// Tests: claim_lp_rewards
+// Tests: mint_reward (governance-gated)
 // ============================================================================
 
 #[test]
-fn test_claim_lp_rewards_happy_path() {
+fn test_mint_reward_happy_path() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    let k: u128 = 2u128 << 64;
-    env.init_market_rewards(1000, k, 216_000);
 
-    let lp_owner = Keypair::new();
-    let user = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let dest_ata = env.create_coin_ata(&recipient, 0);
 
-    let lp_idx = env.init_lp(&lp_owner);
-    let user_idx = env.init_user(&user);
+    env.mint_reward(5000, &dest_ata);
 
-    env.deposit(&lp_owner, lp_idx, 100_000_000);
-    env.deposit(&user, user_idx, 100_000_000);
-
-    env.trade(&user, &lp_owner, lp_idx, user_idx, 1_000_000);
-
-    let coin_ata = env.create_coin_ata(&lp_owner.pubkey(), 0);
-    env.claim_lp_rewards(&lp_owner, lp_idx, &coin_ata);
-
-    let balance = env.read_token_balance(&coin_ata);
-    println!("LP reward balance: {}", balance);
-    assert!(balance > 0, "LP should receive some COIN from fees");
+    let balance = env.read_token_balance(&dest_ata);
+    assert_eq!(balance, 5000, "Recipient should receive 5000 COIN");
 }
 
 #[test]
-fn test_claim_lp_rewards_wrong_owner() {
+fn test_mint_reward_wrong_authority_fails() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    let k: u128 = 2u128 << 64;
-    env.init_market_rewards(1000, k, 216_000);
-
-    let lp_owner = Keypair::new();
-    let user = Keypair::new();
-
-    let lp_idx = env.init_lp(&lp_owner);
-    let user_idx = env.init_user(&user);
-
-    env.deposit(&lp_owner, lp_idx, 100_000_000);
-    env.deposit(&user, user_idx, 100_000_000);
-    env.trade(&user, &lp_owner, lp_idx, user_idx, 1_000_000);
 
     let attacker = Keypair::new();
-    env.svm
-        .airdrop(&attacker.pubkey(), 10_000_000_000)
-        .unwrap();
-    let attacker_ata = env.create_coin_ata(&attacker.pubkey(), 0);
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
 
-    let result = env.try_claim_lp_rewards(&attacker, lp_idx, &attacker_ata);
-    assert!(result.is_err(), "Wrong LP owner should be rejected");
+    let dest_ata = env.create_coin_ata(&attacker.pubkey(), 0);
+    let result = env.try_mint_reward_with_signer(&attacker, 5000, &dest_ata);
+    assert!(result.is_err(), "Non-authority should be rejected");
 }
 
 #[test]
-fn test_claim_lp_rewards_multiple_claims() {
+fn test_mint_reward_zero_amount_fails() {
     let mut env = TestEnv::new();
     env.init_coin_config();
-    let k: u128 = 1u128 << 64;
-    env.init_market_rewards(1000, k, 216_000);
 
-    let lp_owner = Keypair::new();
-    let user = Keypair::new();
+    let dest = Pubkey::new_unique();
+    let dest_ata = env.create_coin_ata(&dest, 0);
 
-    let lp_idx = env.init_lp(&lp_owner);
-    let user_idx = env.init_user(&user);
-
-    env.deposit(&lp_owner, lp_idx, 100_000_000);
-    env.deposit(&user, user_idx, 100_000_000);
-
-    env.trade(&user, &lp_owner, lp_idx, user_idx, 1_000_000);
-    let coin_ata = env.create_coin_ata(&lp_owner.pubkey(), 0);
-
-    env.claim_lp_rewards(&lp_owner, lp_idx, &coin_ata);
-    let balance1 = env.read_token_balance(&coin_ata);
-    assert!(balance1 > 0);
-
-    env.advance_blockhash();
-    env.claim_lp_rewards(&lp_owner, lp_idx, &coin_ata);
-    let balance2 = env.read_token_balance(&coin_ata);
-    assert_eq!(balance2, balance1, "No additional rewards without new fees");
-
-    env.advance_blockhash();
-    env.trade(&user, &lp_owner, lp_idx, user_idx, -500_000);
-    env.advance_blockhash();
-    env.claim_lp_rewards(&lp_owner, lp_idx, &coin_ata);
-    let balance3 = env.read_token_balance(&coin_ata);
-    assert!(balance3 > balance2, "More fees should yield more rewards");
+    let result = env.try_mint_reward(0, &dest_ata);
+    assert!(result.is_err(), "Minting 0 should fail");
 }
 
 #[test]
-fn test_claim_lp_rewards_no_fees() {
-    let mut env = TestEnv::with_trading_fee(0);
+fn test_mint_reward_multiple_recipients() {
+    let mut env = TestEnv::new();
     env.init_coin_config();
-    let k: u128 = 1u128 << 64;
-    env.init_market_rewards(1000, k, 216_000);
 
-    let lp_owner = Keypair::new();
-    let user = Keypair::new();
+    let alice_ata = env.create_coin_ata(&Pubkey::new_unique(), 0);
+    let bob_ata = env.create_coin_ata(&Pubkey::new_unique(), 0);
 
-    let lp_idx = env.init_lp(&lp_owner);
-    let user_idx = env.init_user(&user);
+    env.mint_reward(1000, &alice_ata);
+    env.advance_blockhash();
+    env.mint_reward(2000, &bob_ata);
 
-    env.deposit(&lp_owner, lp_idx, 100_000_000);
-    env.deposit(&user, user_idx, 100_000_000);
-
-    env.trade(&user, &lp_owner, lp_idx, user_idx, 1_000_000);
-
-    let coin_ata = env.create_coin_ata(&lp_owner.pubkey(), 0);
-    env.claim_lp_rewards(&lp_owner, lp_idx, &coin_ata);
-
-    let balance = env.read_token_balance(&coin_ata);
-    assert_eq!(balance, 0, "No fees = no LP rewards");
+    assert_eq!(env.read_token_balance(&alice_ata), 1000);
+    assert_eq!(env.read_token_balance(&bob_ata), 2000);
 }
 
 // ============================================================================
@@ -2283,11 +2188,8 @@ fn test_dao_cannot_steal_via_admin_instructions() {
     let mut env = TestEnv::new();
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    let lp_owner = Keypair::new();
     let user = Keypair::new();
-    let lp_idx = env.init_lp(&lp_owner);
     let user_idx = env.init_user(&user);
-    env.deposit(&lp_owner, lp_idx, 100_000_000);
     env.deposit(&user, user_idx, 100_000_000);
 
     let r = try_percolator_admin_ix_2(
@@ -2322,14 +2224,14 @@ fn test_no_instruction_to_redirect_user_funds() {
     // 2 = unstake (user withdraws own collateral + claims COIN)
     // 3 = init_coin_config (creates shared COIN config, no fund transfer)
     // 4 = claim_stake_rewards (mints COIN to staker, no collateral transfer)
-    // 5 = claim_lp_rewards (mints COIN to LP owner, no collateral transfer)
+    // 5 = mint_reward (governance-gated COIN mint to any destination)
     //
     // Staked collateral can only be withdrawn by the staker who deposited it.
     // COIN is only minted, never transferred from user accounts.
 
     let mut env = TestEnv::new();
     env.init_coin_config();
-    env.init_market_rewards(1000, 1u128 << 64, 100);
+    env.init_market_rewards(1000, 100);
 
     let staker = Keypair::new();
     env.svm
@@ -2346,29 +2248,15 @@ fn test_no_instruction_to_redirect_user_funds() {
 
     env.set_clock(200);
     let result = env.try_claim_stake_rewards_to(&attacker, &attacker_coin);
-    // This should fail because attacker has no StakePosition PDA
     assert!(result.is_err(), "Attacker cannot steal stake rewards");
 
     // Attacker cannot unstake staker's collateral
     let result = env.try_unstake(&attacker, 1_000_000);
     assert!(result.is_err(), "Attacker cannot unstake others' collateral");
 
-    // Attacker cannot claim LP rewards for an LP they don't own
-    let lp_owner = Keypair::new();
-    let user = Keypair::new();
-    let lp_idx = env.init_lp(&lp_owner);
-    let user_idx = env.init_user(&user);
-    env.deposit(&lp_owner, lp_idx, 100_000_000);
-    env.deposit(&user, user_idx, 100_000_000);
-    env.trade(&user, &lp_owner, lp_idx, user_idx, 1_000_000);
-
-    let r = env.try_claim_lp_rewards(&attacker, lp_idx, &attacker_coin);
-    assert!(r.is_err(), "Attacker cannot steal LP rewards");
-
-    // Only the real LP owner can claim
-    let lp_ata = env.create_coin_ata(&lp_owner.pubkey(), 0);
-    env.claim_lp_rewards(&lp_owner, lp_idx, &lp_ata);
-    assert!(env.read_token_balance(&lp_ata) > 0, "Real LP owner gets their rewards");
+    // Attacker cannot mint_reward (not DAO authority)
+    let result = env.try_mint_reward_with_signer(&attacker, 1000, &attacker_coin);
+    assert!(result.is_err(), "Attacker cannot mint COIN via mint_reward");
 }
 
 #[test]
@@ -2376,11 +2264,8 @@ fn test_insurance_topup_permissionless_withdraw_restricted() {
     let mut env = TestEnv::new();
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    let lp_owner = Keypair::new();
     let user = Keypair::new();
-    let lp_idx = env.init_lp(&lp_owner);
     let user_idx = env.init_user(&user);
-    env.deposit(&lp_owner, lp_idx, 100_000_000);
     env.deposit(&user, user_idx, 100_000_000);
 
     let donor = Keypair::new();
@@ -2435,14 +2320,13 @@ fn test_insurance_topup_permissionless_withdraw_restricted() {
 // ============================================================================
 
 #[test]
-fn test_e2e_stake_earn_unstake() {
+fn test_e2e_stake_earn_unstake_and_mint_reward() {
     let mut env = TestEnv::new();
     env.init_coin_config();
     let n = 500u64;
-    let k: u128 = 1u128 << 64;
     let epoch_slots = 100u64;
 
-    env.init_market_rewards(n, k, epoch_slots);
+    env.init_market_rewards(n, epoch_slots);
 
     // Set up staker
     let staker = Keypair::new();
@@ -2452,17 +2336,6 @@ fn test_e2e_stake_earn_unstake() {
 
     // Stake collateral
     env.stake(&staker, 2_000_000);
-
-    // Set up LP and user for trading
-    let lp_owner = Keypair::new();
-    let user = Keypair::new();
-    let lp_idx = env.init_lp(&lp_owner);
-    let user_idx = env.init_user(&user);
-    env.deposit(&lp_owner, lp_idx, 100_000_000);
-    env.deposit(&user, user_idx, 100_000_000);
-
-    // Trade to generate LP fees
-    env.trade(&user, &lp_owner, lp_idx, user_idx, 1_000_000);
 
     // Advance 2 epochs
     env.set_clock(300);
@@ -2480,12 +2353,12 @@ fn test_e2e_stake_earn_unstake() {
     let col_balance = env.read_token_balance(&col_ata);
     assert_eq!(col_balance, 2_000_000, "Should get all collateral back");
 
-    // Claim LP rewards
-    let coin_ata_lp = env.create_coin_ata(&lp_owner.pubkey(), 0);
-    env.claim_lp_rewards(&lp_owner, lp_idx, &coin_ata_lp);
-    let lp_balance = env.read_token_balance(&coin_ata_lp);
-    println!("LP rewards: {}", lp_balance);
-    assert!(lp_balance > 0, "LP should get rewards from fees");
+    // DAO mints reward to an LP (governance-voted)
+    let lp_recipient = Pubkey::new_unique();
+    let lp_coin_ata = env.create_coin_ata(&lp_recipient, 0);
+    env.advance_blockhash();
+    env.mint_reward(3000, &lp_coin_ata);
+    assert_eq!(env.read_token_balance(&lp_coin_ata), 3000, "LP should get governance-voted reward");
 }
 
 // ============================================================================
@@ -2541,7 +2414,7 @@ fn test_unauthorized_market_cannot_inflate_shared_coin() {
             AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
-        data: encode_init_market_rewards(u64::MAX, 1u128 << 64, 100),
+        data: encode_init_market_rewards(u64::MAX, 100),
     };
     let tx = Transaction::new_signed_with_payer(
         &[ix],

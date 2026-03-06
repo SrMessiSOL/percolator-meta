@@ -1,11 +1,11 @@
 # Percolator Rewards Program
 
-Solana program that adds staking vault rewards and LP fee rewards to [Percolator](https://github.com/aeyakovenko/percolator-prog) markets, governed by MetaDAO futarchy.
+Solana program that adds staking vault rewards to [Percolator](https://github.com/aeyakovenko/percolator-prog) markets, governed by MetaDAO futarchy.
 
 ## Overview
 
 - **Staking vault**: Users deposit collateral into a per-market vault to earn COIN rewards over time (Synthetix-style accumulator)
-- **LP rewards**: Liquidity providers earn COIN proportional to fees earned, via CPI to Percolator's `QueryLpFees`
+- **Governance-gated minting**: The DAO can vote to mint COIN to any destination (e.g., rewarding best-performing LPs identified off-chain)
 - **COIN token**: Minted exclusively by this program via a PDA mint authority. Shared across all markets managed by the same DAO
 - **No admin keys**: All governance actions are futarchy-gated. Market admin is burned at creation. The program is deployed non-upgradeable
 
@@ -25,23 +25,21 @@ Solana program that adds staking vault rewards and LP fee rewards to [Percolator
 | 2 | `unstake` | Withdraw collateral + claim pending COIN (lockup enforced) |
 | 3 | `init_coin_config` | One-time setup of COIN mint authority config |
 | 4 | `claim_stake_rewards` | Harvest pending COIN without unstaking (no lockup check) |
-| 5 | `claim_lp_rewards` | Claim COIN for LP fee earnings via CPI |
+| 5 | `mint_reward` | Governance-gated: mint COIN to any destination (requires CoinConfig authority) |
 
 ## Accounts
 
 | Account | PDA Seeds | Description |
 |---------|-----------|-------------|
-| CoinConfig | `[b"coin_cfg", coin_mint]` | Authority that can register new markets for a COIN |
+| CoinConfig | `[b"coin_cfg", coin_mint]` | Authority that can register new markets and mint rewards |
 | MarketRewardsCfg | `[b"mrc", market_slab]` | Per-market reward parameters and accumulator state |
 | StakePosition | `[b"sp", market_slab, user]` | Per-user staking position |
-| LpClaimState | `[b"lcs", market_slab, lp_idx]` | Per-LP cumulative claim tracking |
 | Stake Vault | `[b"stake_vault", market_slab]` | SPL token account holding staked collateral |
 | Mint Authority | `[b"coin_mint_authority", coin_mint]` | PDA that signs COIN mints |
 
 ## Dependencies
 
-- [percolator-prog](https://github.com/aeyakovenko/percolator-prog) — Percolator Solana program (provides `state::read_market_start_slot`, `QueryLpFees`)
-- [percolator](https://github.com/aeyakovenko/percolator) — Core library (account layout, `RiskEngine` constants)
+- [percolator-prog](https://github.com/aeyakovenko/percolator-prog) — Percolator Solana program (provides `state::read_market_start_slot`)
 
 ## Building
 

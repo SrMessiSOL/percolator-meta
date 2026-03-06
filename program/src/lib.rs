@@ -1,5 +1,6 @@
-//! Rewards program: staking vault + COIN rewards for insurance depositors and LPs.
-//! Non-upgradeable. No admin keys. CoinConfig authority gates market registration.
+//! Rewards program: staking vault + COIN rewards for Percolator market stakers.
+//! Non-upgradeable. No admin keys. CoinConfig authority gates market registration
+//! and governance-voted COIN payouts (e.g. LP rewards).
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -26,15 +27,10 @@ use solana_program::{
 
 declare_id!("Rewards111111111111111111111111111111111111");
 
-// Re-export percolator-prog types we need
-use percolator_prog::constants::ENGINE_OFF;
 use percolator_prog::state;
 
 /// Fixed-point scale for reward math.
 pub const FP: u128 = 1u128 << 64;
-
-/// Hard cap on K to bound COIN inflation from LP rewards.
-pub const MAX_LP_COIN_PER_FEE_FP: u128 = 1_000_000u128 << 64; // 1M COIN per fee-atom max
 
 /// Instruction tags
 const IX_INIT_MARKET_REWARDS: u8 = 0;
@@ -42,25 +38,22 @@ const IX_STAKE: u8 = 1;
 const IX_UNSTAKE: u8 = 2;
 const IX_INIT_COIN_CONFIG: u8 = 3;
 const IX_CLAIM_STAKE_REWARDS: u8 = 4;
-const IX_CLAIM_LP_REWARDS: u8 = 5;
+const IX_MINT_REWARD: u8 = 5;
 
 // ============================================================================
 // Account sizes
 // ============================================================================
 
-/// MarketRewardsCfg: 8 + 32 + 32 + 32 + 8 + 16 + 8 + 8 + 16 + 8 + 8 = 176
-const MRC_SIZE: usize = 8 + 32 + 32 + 32 + 8 + 16 + 8 + 8 + 16 + 8 + 8;
+/// MarketRewardsCfg: 8 + 32 + 32 + 32 + 8 + 8 + 8 + 16 + 8 + 8 = 160
+const MRC_SIZE: usize = 8 + 32 + 32 + 32 + 8 + 8 + 8 + 16 + 8 + 8;
 /// StakePosition: 8 + 8 + 8 + 16 + 8 = 48
 const SP_SIZE: usize = 8 + 8 + 8 + 16 + 8;
-/// LpClaimState: 8 + 32 = 40 (u256 = 32 bytes)
-const LCS_SIZE: usize = 8 + 32;
 /// CoinConfig: 8 + 32 = 40
 const COIN_CFG_SIZE: usize = 8 + 32;
 
 // Discriminators
-const MRC_DISC: [u8; 8] = *b"MRC_V002";
+const MRC_DISC: [u8; 8] = *b"MRC_V003";
 const SP_DISC: [u8; 8] = *b"SP__INIT";
-const LCS_DISC: [u8; 8] = *b"LCS_INIT";
 const COIN_CFG_DISC: [u8; 8] = *b"CCFG_INI";
 
 // ============================================================================
@@ -98,24 +91,10 @@ fn read_u8(data: &mut &[u8]) -> Result<u8, ProgramError> {
     Ok(val)
 }
 
-fn read_u16(data: &mut &[u8]) -> Result<u16, ProgramError> {
-    if data.len() < 2 { return Err(ProgramError::InvalidInstructionData); }
-    let val = u16::from_le_bytes([data[0], data[1]]);
-    *data = &data[2..];
-    Ok(val)
-}
-
 fn read_u64(data: &mut &[u8]) -> Result<u64, ProgramError> {
     if data.len() < 8 { return Err(ProgramError::InvalidInstructionData); }
     let val = u64::from_le_bytes(data[..8].try_into().unwrap());
     *data = &data[8..];
-    Ok(val)
-}
-
-fn read_u128(data: &mut &[u8]) -> Result<u128, ProgramError> {
-    if data.len() < 16 { return Err(ProgramError::InvalidInstructionData); }
-    let val = u128::from_le_bytes(data[..16].try_into().unwrap());
-    *data = &data[16..];
     Ok(val)
 }
 
@@ -150,12 +129,11 @@ struct MarketRewardsCfg {
     coin_mint: Pubkey,          // [40..72]
     collateral_mint: Pubkey,    // [72..104]
     n_per_epoch: u64,           // [104..112] COIN emitted per epoch to stakers
-    k: u128,                    // [112..128] LP COIN per fee-atom (FP)
-    epoch_slots: u64,           // [128..136] minimum lockup / reward period
-    market_start_slot: u64,     // [136..144] from slab
-    reward_per_token_stored: u128, // [144..160] accumulator (FP)
-    last_update_slot: u64,      // [160..168]
-    total_staked: u64,          // [168..176]
+    epoch_slots: u64,           // [112..120] minimum lockup / reward period
+    market_start_slot: u64,     // [120..128] from slab
+    reward_per_token_stored: u128, // [128..144] accumulator (FP)
+    last_update_slot: u64,      // [144..152]
+    total_staked: u64,          // [152..160]
 }
 
 impl MarketRewardsCfg {
@@ -167,13 +145,12 @@ impl MarketRewardsCfg {
         let coin_mint = Pubkey::new_from_array(data[off..off+32].try_into().unwrap()); off += 32;
         let collateral_mint = Pubkey::new_from_array(data[off..off+32].try_into().unwrap()); off += 32;
         let n_per_epoch = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
-        let k = u128::from_le_bytes(data[off..off+16].try_into().unwrap()); off += 16;
         let epoch_slots = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
         let market_start_slot = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
         let reward_per_token_stored = u128::from_le_bytes(data[off..off+16].try_into().unwrap()); off += 16;
         let last_update_slot = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
         let total_staked = u64::from_le_bytes(data[off..off+8].try_into().unwrap());
-        Ok(Self { market_slab, coin_mint, collateral_mint, n_per_epoch, k, epoch_slots,
+        Ok(Self { market_slab, coin_mint, collateral_mint, n_per_epoch, epoch_slots,
                   market_start_slot, reward_per_token_stored, last_update_slot, total_staked })
     }
 
@@ -184,7 +161,6 @@ impl MarketRewardsCfg {
         data[off..off+32].copy_from_slice(self.coin_mint.as_ref()); off += 32;
         data[off..off+32].copy_from_slice(self.collateral_mint.as_ref()); off += 32;
         data[off..off+8].copy_from_slice(&self.n_per_epoch.to_le_bytes()); off += 8;
-        data[off..off+16].copy_from_slice(&self.k.to_le_bytes()); off += 16;
         data[off..off+8].copy_from_slice(&self.epoch_slots.to_le_bytes()); off += 8;
         data[off..off+8].copy_from_slice(&self.market_start_slot.to_le_bytes()); off += 8;
         data[off..off+16].copy_from_slice(&self.reward_per_token_stored.to_le_bytes()); off += 16;
@@ -277,7 +253,7 @@ fn mint_coin<'a>(
     )
 }
 
-/// Update the reward accumulator in MRC. Returns updated reward_per_token.
+/// Update the reward accumulator in MRC.
 fn update_accumulator(cfg: &mut MarketRewardsCfg, current_slot: u64) {
     if cfg.total_staked == 0 || current_slot <= cfg.last_update_slot || cfg.epoch_slots == 0 {
         cfg.last_update_slot = current_slot;
@@ -308,46 +284,18 @@ fn settle_pending(pos: &mut StakePosition, reward_per_token: u128) {
     pos.reward_per_token_paid = reward_per_token;
 }
 
-/// Read LP owner pubkey from slab account data.
-fn read_lp_owner_from_slab(slab_data: &[u8], lp_idx: u16) -> Result<Pubkey, ProgramError> {
-    let engine_data = &slab_data[ENGINE_OFF..];
-    let acct = read_account_from_engine(engine_data, lp_idx)?;
-    if acct.kind != 1 {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    Ok(Pubkey::new_from_array(acct.owner))
+/// Verify CoinConfig PDA and return authority.
+fn load_coin_config(
+    coin_cfg_account: &AccountInfo,
+    coin_mint: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<CoinConfig, ProgramError> {
+    let (expected_cfg, _) = Pubkey::find_program_address(&coin_cfg_seeds(coin_mint), program_id);
+    if *coin_cfg_account.key != expected_cfg { return Err(ProgramError::InvalidSeeds); }
+    if coin_cfg_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
+    let cfg_data = coin_cfg_account.try_borrow_data()?;
+    CoinConfig::deserialize(&cfg_data)
 }
-
-struct AccountSlice {
-    kind: u8,
-    owner: [u8; 32],
-    #[allow(dead_code)]
-    fees_earned_total: u128,
-}
-
-fn read_account_from_engine(engine_data: &[u8], idx: u16) -> Result<AccountSlice, ProgramError> {
-    use core::mem::size_of;
-    let account_size: usize = size_of::<percolator::Account>();
-    let engine_size = size_of::<percolator::RiskEngine>();
-    let max_accounts = percolator::MAX_ACCOUNTS;
-    let accounts_offset = engine_size - max_accounts * account_size;
-
-    let acct_start = accounts_offset + (idx as usize) * account_size;
-    let acct_end = acct_start + account_size;
-    if acct_end > engine_data.len() {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    let acct_data = &engine_data[acct_start..acct_end];
-    let kind = acct_data[24];
-    let owner_off = 8 + 16 + 1 + 7 + 16 + 8 + 8 + 16 + 16 + 8 + 16 + 32 + 32;
-    let owner: [u8; 32] = acct_data[owner_off..owner_off+32].try_into().unwrap();
-    let fees_off = owner_off + 32 + 16 + 8;
-    let fees_earned_total = u128::from_le_bytes(acct_data[fees_off..fees_off+16].try_into().unwrap());
-
-    Ok(AccountSlice { kind, owner, fees_earned_total })
-}
-
 
 // ============================================================================
 // Entrypoint
@@ -369,7 +317,7 @@ pub fn process_instruction<'a>(
         IX_UNSTAKE => process_unstake(program_id, accounts, &mut data),
         IX_INIT_COIN_CONFIG => process_init_coin_config(program_id, accounts, &mut data),
         IX_CLAIM_STAKE_REWARDS => process_claim_stake_rewards(program_id, accounts),
-        IX_CLAIM_LP_REWARDS => process_claim_lp_rewards(program_id, accounts, &mut data),
+        IX_MINT_REWARD => process_mint_reward(program_id, accounts, &mut data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -444,7 +392,7 @@ fn process_init_coin_config<'a>(
 //   [8] rent sysvar
 //   [9] system_program
 //
-// Data: N (u64), K (u128), epoch_slots (u64)
+// Data: N (u64), epoch_slots (u64)
 
 fn process_init_market_rewards<'a>(
     program_id: &Pubkey,
@@ -468,26 +416,15 @@ fn process_init_market_rewards<'a>(
     }
 
     let n_per_epoch = read_u64(data)?;
-    let k = read_u128(data)?;
     let epoch_slots = read_u64(data)?;
 
-    if k > MAX_LP_COIN_PER_FEE_FP {
-        msg!("K exceeds MAX_LP_COIN_PER_FEE_FP");
-        return Err(ProgramError::InvalidInstructionData);
-    }
     if epoch_slots == 0 {
         msg!("epoch_slots must be > 0");
         return Err(ProgramError::InvalidInstructionData);
     }
 
     // Verify CoinConfig PDA and authority
-    let (expected_cfg, _) = Pubkey::find_program_address(&coin_cfg_seeds(coin_mint.key), program_id);
-    if *coin_cfg_account.key != expected_cfg { return Err(ProgramError::InvalidSeeds); }
-    if coin_cfg_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
-
-    let cfg_data = coin_cfg_account.try_borrow_data()?;
-    let coin_cfg = CoinConfig::deserialize(&cfg_data)?;
-    drop(cfg_data);
+    let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
 
     if *authority.key != coin_cfg.authority {
         msg!("Signer does not match CoinConfig authority");
@@ -513,7 +450,6 @@ fn process_init_market_rewards<'a>(
         coin_mint: *coin_mint.key,
         collateral_mint: *collateral_mint.key,
         n_per_epoch,
-        k,
         epoch_slots,
         market_start_slot,
         reward_per_token_stored: 0,
@@ -867,146 +803,50 @@ fn process_claim_stake_rewards<'a>(
 }
 
 // ============================================================================
-// claim_lp_rewards
+// mint_reward — governance-gated COIN mint to any destination
 // ============================================================================
 // Accounts:
-//   [0] lp_owner (signer)
-//   [1] mrc PDA (read-only)
-//   [2] market_slab (read-only)
-//   [3] lp_claim_state PDA (writable)
-//   [4] coin_mint (writable)
-//   [5] coin_ata (writable)
-//   [6] mint_authority PDA (read-only)
-//   [7] token_program
-//   [8] percolator_program
-//   [9] system_program
+//   [0] authority (signer — must match CoinConfig.authority)
+//   [1] coin_mint (writable)
+//   [2] coin_config PDA (read-only)
+//   [3] destination (writable — any SPL token account for this mint)
+//   [4] mint_authority PDA (read-only)
+//   [5] token_program
 //
-// Data: lp_idx (u16)
+// Data: amount (u64)
 
-fn process_claim_lp_rewards<'a>(
+fn process_mint_reward<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
     data: &mut &[u8],
 ) -> ProgramResult {
     let iter = &mut accounts.iter();
-    let lp_owner = next_account_info(iter)?;
-    let mrc_account = next_account_info(iter)?;
-    let market_slab = next_account_info(iter)?;
-    let lcs_account = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
     let coin_mint = next_account_info(iter)?;
-    let coin_ata = next_account_info(iter)?;
+    let coin_cfg_account = next_account_info(iter)?;
+    let destination = next_account_info(iter)?;
     let mint_authority = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
-    let percolator_program = next_account_info(iter)?;
-    let system_program = next_account_info(iter)?;
 
-    let lp_idx = read_u16(data)?;
+    let amount = read_u64(data)?;
+    if amount == 0 { return Err(ProgramError::InvalidInstructionData); }
+    if !authority.is_signer { return Err(ProgramError::MissingRequiredSignature); }
 
-    if !lp_owner.is_signer {
+    // Verify CoinConfig and authority
+    let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
+    if *authority.key != coin_cfg.authority {
+        msg!("Signer does not match CoinConfig authority");
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Read MarketRewardsCfg
-    let mrc_data = mrc_account.try_borrow_data()?;
-    let cfg = MarketRewardsCfg::deserialize(&mrc_data)?;
-    drop(mrc_data);
-
-    // Verify MRC PDA
-    let (expected_mrc, _) = Pubkey::find_program_address(&mrc_seeds(&cfg.market_slab), program_id);
-    if *mrc_account.key != expected_mrc { return Err(ProgramError::InvalidSeeds); }
-    if mrc_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
-    if *market_slab.key != cfg.market_slab { return Err(ProgramError::InvalidAccountData); }
-    if market_slab.owner != percolator_program.key {
-        msg!("market_slab owner does not match percolator_program");
-        return Err(ProgramError::IllegalOwner);
-    }
-
-    // Verify signer is the LP position's owner
-    let slab_data = market_slab.try_borrow_data()?;
-    let lp_owner_pubkey = read_lp_owner_from_slab(&slab_data, lp_idx)?;
-    drop(slab_data);
-
-    if *lp_owner.key != lp_owner_pubkey {
-        msg!("Signer does not match LP position owner");
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-
-    // CPI to percolator::QueryLpFees
-    let query_ix_data = {
-        let mut d = alloc::vec![24u8]; // tag = 24
-        d.extend_from_slice(&lp_idx.to_le_bytes());
-        d
-    };
-    let query_ix = solana_program::instruction::Instruction {
-        program_id: *percolator_program.key,
-        accounts: alloc::vec![
-            solana_program::instruction::AccountMeta::new_readonly(*market_slab.key, false),
-        ],
-        data: query_ix_data,
-    };
-    invoke(&query_ix, &[market_slab.clone(), percolator_program.clone()])?;
-
-    let (returning_program, return_data) = solana_program::program::get_return_data()
-        .ok_or(ProgramError::InvalidAccountData)?;
-    if returning_program != *percolator_program.key { return Err(ProgramError::InvalidAccountData); }
-    if return_data.len() < 16 { return Err(ProgramError::InvalidAccountData); }
-    let fees_earned_total = u128::from_le_bytes(return_data[..16].try_into().unwrap());
-
-    // LP reward math (§8.3):
-    let (entitled_lo, entitled_hi) = mul_u128_wide(fees_earned_total, cfg.k);
-
-    let lp_idx_bytes = lp_idx.to_le_bytes();
-    let lcs_seeds_arr: [&[u8]; 3] = [b"lcs", cfg.market_slab.as_ref(), &lp_idx_bytes];
-    let (expected_lcs, _) = Pubkey::find_program_address(&lcs_seeds_arr, program_id);
-    if *lcs_account.key != expected_lcs { return Err(ProgramError::InvalidSeeds); }
-
-    let (claimed_lo, claimed_hi): (u128, u128);
-    if lcs_account.data_len() == 0 {
-        create_pda_account(lp_owner, lcs_account, system_program, program_id, &lcs_seeds_arr, LCS_SIZE)?;
-        let mut lcs_data = lcs_account.try_borrow_mut_data()?;
-        lcs_data[..8].copy_from_slice(&LCS_DISC);
-        lcs_data[8..40].copy_from_slice(&[0u8; 32]);
-        drop(lcs_data);
-        claimed_lo = 0;
-        claimed_hi = 0;
-    } else {
-        if lcs_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
-        let lcs_data = lcs_account.try_borrow_data()?;
-        if lcs_data.len() < LCS_SIZE || lcs_data[..8] != LCS_DISC { return Err(ProgramError::InvalidAccountData); }
-        claimed_lo = u128::from_le_bytes(lcs_data[8..24].try_into().unwrap());
-        claimed_hi = u128::from_le_bytes(lcs_data[24..40].try_into().unwrap());
-        drop(lcs_data);
-    }
-
-    let (claimable_lo, claimable_hi) = sub_u256(entitled_lo, entitled_hi, claimed_lo, claimed_hi);
-    let claimable_coins_u128 = (claimable_lo >> 64) | (claimable_hi << 64);
-    let claimable_coins: u64 = if claimable_coins_u128 > u64::MAX as u128 {
-        return Err(ProgramError::ArithmeticOverflow);
-    } else {
-        claimable_coins_u128 as u64
-    };
-
-    if claimable_coins == 0 { return Ok(()); }
-
-    if *coin_mint.key != cfg.coin_mint { return Err(ProgramError::InvalidAccountData); }
-
-    let ma_seeds = mint_authority_seeds(&cfg.coin_mint);
+    // Verify mint authority PDA
+    let ma_seeds = mint_authority_seeds(coin_mint.key);
     let (expected_ma, ma_bump) = Pubkey::find_program_address(&ma_seeds, program_id);
     if *mint_authority.key != expected_ma { return Err(ProgramError::InvalidSeeds); }
+
     let bump_bytes = [ma_bump];
-    let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", cfg.coin_mint.as_ref(), &bump_bytes];
-    mint_coin(token_program, coin_mint, coin_ata, mint_authority, claimable_coins, &signer_seeds)?;
-
-    // Update LpClaimState
-    let added_lo = (claimable_coins as u128) << 64;
-    let added_hi = (claimable_coins as u128) >> 64;
-    let (new_claimed_lo, new_claimed_hi) = add_u256(claimed_lo, claimed_hi, added_lo, added_hi);
-
-    let mut lcs_data = lcs_account.try_borrow_mut_data()?;
-    lcs_data[8..24].copy_from_slice(&new_claimed_lo.to_le_bytes());
-    lcs_data[24..40].copy_from_slice(&new_claimed_hi.to_le_bytes());
-
-    Ok(())
+    let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", coin_mint.key.as_ref(), &bump_bytes];
+    mint_coin(token_program, coin_mint, destination, mint_authority, amount, &signer_seeds)
 }
 
 // ============================================================================
@@ -1028,21 +868,6 @@ fn mul_u128_wide(a: u128, b: u128) -> (u128, u128) {
     let lo = (ll & 0xFFFF_FFFF_FFFF_FFFF) | (mid << 64);
     let hi = hh + (lh >> 64) + (hl >> 64) + (mid >> 64);
 
-    (lo, hi)
-}
-
-fn sub_u256(a_lo: u128, a_hi: u128, b_lo: u128, b_hi: u128) -> (u128, u128) {
-    if a_hi < b_hi || (a_hi == b_hi && a_lo < b_lo) {
-        return (0, 0);
-    }
-    let (lo, borrow) = a_lo.overflowing_sub(b_lo);
-    let hi = a_hi - b_hi - if borrow { 1 } else { 0 };
-    (lo, hi)
-}
-
-fn add_u256(a_lo: u128, a_hi: u128, b_lo: u128, b_hi: u128) -> (u128, u128) {
-    let (lo, carry) = a_lo.overflowing_add(b_lo);
-    let hi = a_hi.saturating_add(b_hi).saturating_add(if carry { 1 } else { 0 });
     (lo, hi)
 }
 
