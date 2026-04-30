@@ -14,6 +14,8 @@ use solana_program::{
     msg,
     program::invoke_signed,
     program_error::ProgramError,
+    program_option::COption,
+    program_pack::Pack,
     pubkey::Pubkey,
     rent::Rent,
     system_instruction,
@@ -28,6 +30,31 @@ const IX_INIT_AUTHORITY: u8 = 0;
 const IX_INIT_COIN_CONFIG: u8 = 1;
 const IX_INIT_MARKET_REWARDS: u8 = 2;
 const IX_DRAW_INSURANCE: u8 = 3;
+
+const AUTHORITY_DISC: [u8; 8] = *b"GAUTH001";
+const AUTHORITY_SIZE: usize = 8 + 32;
+
+struct AuthorityConfig {
+    controller: Pubkey,
+}
+
+impl AuthorityConfig {
+    fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
+        if data.len() < AUTHORITY_SIZE {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if data[..8] != AUTHORITY_DISC {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let controller = Pubkey::new_from_array(data[8..40].try_into().unwrap());
+        Ok(Self { controller })
+    }
+
+    fn serialize(&self, data: &mut [u8]) {
+        data[..8].copy_from_slice(&AUTHORITY_DISC);
+        data[8..40].copy_from_slice(self.controller.as_ref());
+    }
+}
 
 fn read_u8(data: &mut &[u8]) -> Result<u8, ProgramError> {
     if data.is_empty() {
@@ -48,7 +75,11 @@ fn read_u64(data: &mut &[u8]) -> Result<u64, ProgramError> {
 }
 
 fn authority_seeds<'a>(rewards_program: &'a Pubkey, coin_mint: &'a Pubkey) -> [&'a [u8]; 3] {
-    [b"rewards_authority", rewards_program.as_ref(), coin_mint.as_ref()]
+    [
+        b"rewards_authority",
+        rewards_program.as_ref(),
+        coin_mint.as_ref(),
+    ]
 }
 
 fn authority_signer_seeds<'a>(
@@ -73,7 +104,7 @@ fn verify_authority<'a>(
     authority: &AccountInfo<'a>,
     rewards_program: &Pubkey,
     coin_mint: &Pubkey,
-) -> Result<u8, ProgramError> {
+) -> Result<(u8, AuthorityConfig), ProgramError> {
     let (expected, bump) = authority_address(rewards_program, coin_mint);
     if *authority.key != expected {
         msg!("Governance authority PDA mismatch");
@@ -83,7 +114,40 @@ fn verify_authority<'a>(
         msg!("Governance authority must be owned by governance adapter");
         return Err(ProgramError::IllegalOwner);
     }
-    Ok(bump)
+    let data = authority.try_borrow_data()?;
+    let cfg = AuthorityConfig::deserialize(&data)?;
+    Ok((bump, cfg))
+}
+
+fn require_controller(controller: &AccountInfo, expected: &Pubkey) -> ProgramResult {
+    if !controller.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if controller.key != expected {
+        msg!("Governance adapter controller mismatch");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    Ok(())
+}
+
+fn verify_mint_controller(controller: &AccountInfo, coin_mint: &AccountInfo) -> ProgramResult {
+    if coin_mint.owner != &spl_token::ID {
+        msg!("COIN mint must be owned by SPL Token program");
+        return Err(ProgramError::IllegalOwner);
+    }
+    let mint_data = coin_mint.try_borrow_data()?;
+    let mint = spl_token::state::Mint::unpack(&mint_data)?;
+    if mint.freeze_authority.is_some() {
+        msg!("COIN mint must have freeze_authority = None");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    match mint.mint_authority {
+        COption::Some(auth) if auth == *controller.key => Ok(()),
+        _ => {
+            msg!("init_authority signer must be current COIN mint authority");
+            Err(ProgramError::MissingRequiredSignature)
+        }
+    }
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
@@ -131,8 +195,13 @@ fn process_init_authority<'a>(
         if authority.owner != program_id {
             return Err(ProgramError::IllegalOwner);
         }
+        let cfg_data = authority.try_borrow_data()?;
+        let cfg = AuthorityConfig::deserialize(&cfg_data)?;
+        require_controller(payer, &cfg.controller)?;
         return Ok(());
     }
+
+    verify_mint_controller(payer, coin_mint)?;
 
     let bump_bytes = [bump];
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
@@ -141,13 +210,20 @@ fn process_init_authority<'a>(
         &system_instruction::create_account(
             payer.key,
             authority.key,
-            rent.minimum_balance(0).max(1),
-            0,
+            rent.minimum_balance(AUTHORITY_SIZE),
+            AUTHORITY_SIZE as u64,
             program_id,
         ),
         &[payer.clone(), authority.clone(), system_program.clone()],
         &[&signer_seeds],
-    )
+    )?;
+
+    let mut data = authority.try_borrow_mut_data()?;
+    let cfg = AuthorityConfig {
+        controller: *payer.key,
+    };
+    cfg.serialize(&mut data);
+    Ok(())
 }
 
 fn process_init_coin_config<'a>(
@@ -166,7 +242,8 @@ fn process_init_coin_config<'a>(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    let bump = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
+    let (bump, cfg) = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
+    require_controller(payer, &cfg.controller)?;
     let bump_bytes = [bump];
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
     let ix = Instruction {
@@ -220,7 +297,8 @@ fn process_init_market_rewards<'a>(
 
     let n_per_epoch = read_u64(data)?;
     let epoch_slots = read_u64(data)?;
-    let bump = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
+    let (bump, cfg) = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
+    require_controller(payer, &cfg.controller)?;
     let bump_bytes = [bump];
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
 
@@ -288,7 +366,8 @@ fn process_draw_insurance<'a>(
     }
 
     let amount = read_u64(data)?;
-    let bump = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
+    let (bump, cfg) = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
+    require_controller(payer, &cfg.controller)?;
     let bump_bytes = [bump];
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
 
@@ -328,4 +407,3 @@ fn process_draw_insurance<'a>(
         &[&signer_seeds],
     )
 }
-

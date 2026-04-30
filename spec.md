@@ -11,6 +11,7 @@ this is a pure solana rust program only.  it should use the same litesvm setup f
 1. User funds are never at risk from futarchy itself: no futarchy-triggerable instruction may transfer, freeze, confiscate, or redirect user balances.
 1. The DAO may stake and claim COIN rewards like any user, but cannot claim other users' staked collateral.
 1. Current implementation assumption: the DAO-controlled client bootstraps the governed authority path for this rewards instance at creation time. `rewards` does not independently prove MetaDAO execution beyond that configured path.
+1. The adapter bootstrap must be signed by the current COIN mint authority before the SPL Token mint-authority handoff to `rewards`; that signer is stored as the adapter controller for subsequent governed CPIs.
 
 -----
 
@@ -97,7 +98,7 @@ The vault is an SPL token account whose authority is the MRC PDA. Users deposit 
 
 ## 7. Market creation (one atomic transaction, permissionless caller)
 
-Bootstrap prerequisite: before the first governed call for a `(rewards_program, coin_mint)` pair, the DAO-controlled client initializes the governance authority path for that pair. The current repo assumes this binding is established during instance creation and then reused for all governed CPIs.
+Bootstrap prerequisite: before the first governed call for a `(rewards_program, coin_mint)` pair, the DAO-controlled client initializes the governance authority path for that pair. `governance_adapter::init_authority` must be signed by the current COIN mint authority, and the resulting authority PDA stores that signer as the controller for later adapter CPIs. After this bootstrap, the DAO-controlled client performs the SPL Token `SetAuthority` handoff that makes `PDA(rewards, [b"coin_mint_authority", coin_mint_key])` the COIN mint authority. The current repo assumes this binding is established during instance creation and then reused for all governed CPIs.
 
 The caller assembles the following instructions in a single transaction after `proposal.executed == true`:
 
