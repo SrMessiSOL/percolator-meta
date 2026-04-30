@@ -1,0 +1,26 @@
+   Compiling governance-adapter v0.1.0 (/Users/khubair/percmeta/fix-critical-findings/governance)
+warning: unexpected `cfg` condition value: `custom-heap`
+   --> governance/src/lib.rs:154:1
+    |
+154 | solana_program::entrypoint!(process_instruction);
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `no-entrypoint` and `test-sbf`
+    = help: consider adding `custom-heap` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `#[warn(unexpected_cfgs)]` on by default
+    = note: this warning originates in the macro `$crate::custom_heap_default` which comes from the expansion of the macro `solana_program::entrypoint` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unexpected `cfg` condition value: `custom-panic`
+   --> governance/src/lib.rs:154:1
+    |
+154 | solana_program::entrypoint!(process_instruction);
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `no-entrypoint` and `test-sbf`
+    = help: consider adding `custom-panic` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: this warning originates in the macro `$crate::custom_panic_default` which comes from the expansion of the macro `solana_program::entrypoint` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `governance-adapter` (lib) generated 2 warnings
+    Finished `release` profile [optimized] target(s) in 0.26s

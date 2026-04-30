@@ -1,0 +1,14 @@
+[package]
+name = "malicious-drain"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "malicious_drain"
+path = "src/lib.rs"
+
+[dependencies]
+solana-program = { workspace = true }
+spl-token = { workspace = true }

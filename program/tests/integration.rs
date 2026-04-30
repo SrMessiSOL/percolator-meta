@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 // Production SLAB_LEN for SBF target.
 // Must match the BPF binary.
-const SLAB_LEN: usize = 1525688;
+const SLAB_LEN: usize = 1525720;
 const MAX_ACCOUNTS: usize = 4096;
 
 const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
@@ -162,11 +162,8 @@ fn encode_init_market(
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&1_000_000u64.to_le_bytes()); // initial_mark_price_e6 (Hyperp needs > 0)
-    // Per-market admin limits
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
-    // RiskParams (v12.17 format)
+    // RiskParams (v12.19 format)
     data.extend_from_slice(&0u64.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
@@ -180,7 +177,6 @@ fn encode_init_market(
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     // Extended tail (66 bytes) — enable insurance withdrawal + permissionless resolve + force close
@@ -383,7 +379,7 @@ impl TestEnv {
     fn new() -> Self {
         let mut svm = LiteSVM::new();
 
-        let percolator_id = Pubkey::new_unique();
+        let percolator_id = percolator_prog::id();
         let perc_bytes = std::fs::read(percolator_path()).expect("read percolator BPF");
         svm.add_program(percolator_id, &perc_bytes);
 
@@ -481,7 +477,8 @@ impl TestEnv {
         svm.airdrop(&dao_authority.pubkey(), 100_000_000_000)
             .unwrap();
 
-        // COIN mint — authority is the rewards PDA derived from coin_mint key
+        // COIN mint starts under DAO authority so the adapter init ceremony can
+        // prove DAO control, then tests hand minting to the rewards PDA.
         let coin_mint = Pubkey::new_unique();
         let (mint_authority_pda, _) = Pubkey::find_program_address(
             &[b"coin_mint_authority", coin_mint.as_ref()],
@@ -493,7 +490,7 @@ impl TestEnv {
             coin_mint,
             Account {
                 lamports: 1_000_000,
-                data: make_mint_data_with_authority(&mint_authority_pda),
+                data: make_mint_data_with_authority(&dao_authority.pubkey()),
                 owner: spl_token::ID,
                 executable: false,
                 rent_epoch: 0,
@@ -520,6 +517,10 @@ impl TestEnv {
         );
         svm.send_transaction(tx)
             .expect("governance init_authority failed");
+
+        let mut coin_account = svm.get_account(&coin_mint).expect("coin mint missing");
+        coin_account.data = make_mint_data_with_authority(&mint_authority_pda);
+        svm.set_account(coin_mint, coin_account).unwrap();
 
         // Init percolator market
         let dummy_ata = Pubkey::new_unique();
