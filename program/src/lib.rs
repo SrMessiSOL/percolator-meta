@@ -28,7 +28,7 @@ use solana_program::{
 declare_id!("Rewards111111111111111111111111111111111111");
 
 use governance_adapter::{authority_address as governance_authority_address, id as governance_program_id};
-use percolator_prog::state;
+use percolator_prog::{accounts as percolator_accounts, constants as percolator_constants, state};
 
 /// Fixed-point scale for reward math.
 pub const FP: u128 = 1u128 << 64;
@@ -277,6 +277,68 @@ fn validate_token_account(
     Ok(())
 }
 
+fn verify_percolator_program(percolator_program: &AccountInfo) -> ProgramResult {
+    if *percolator_program.key != percolator_prog::id() {
+        msg!("Unexpected Percolator program id");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    Ok(())
+}
+
+fn load_percolator_market(
+    market_slab: &AccountInfo,
+    expected_collateral_mint: &Pubkey,
+) -> Result<(state::SlabHeader, state::MarketConfig), ProgramError> {
+    if market_slab.owner != &percolator_prog::id() {
+        msg!("Market slab must be owned by Percolator");
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    let slab_data = market_slab.try_borrow_data()?;
+    if slab_data.len() < percolator_constants::HEADER_LEN + percolator_constants::CONFIG_LEN {
+        msg!("Market slab data too short");
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let header = state::read_header(&slab_data);
+    if header.magic != percolator_constants::MAGIC {
+        msg!("Percolator slab magic mismatch");
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let market_cfg = state::read_config(&slab_data);
+    if market_cfg.collateral_mint != expected_collateral_mint.to_bytes() {
+        msg!("Percolator slab collateral mint mismatch");
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok((header, market_cfg))
+}
+
+fn validate_percolator_vault_accounts(
+    market_slab: &AccountInfo,
+    percolator_vault: &AccountInfo,
+    percolator_vault_pda: &AccountInfo,
+    market_cfg: &state::MarketConfig,
+    collateral_mint: &Pubkey,
+) -> ProgramResult {
+    let (expected_vault_authority, expected_bump) =
+        percolator_accounts::derive_vault_authority(&percolator_prog::id(), market_slab.key);
+    if market_cfg.vault_authority_bump != expected_bump {
+        msg!("Percolator vault authority bump mismatch");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *percolator_vault_pda.key != expected_vault_authority {
+        msg!("Percolator vault authority PDA mismatch");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if *percolator_vault.key != Pubkey::new_from_array(market_cfg.vault_pubkey) {
+        msg!("Percolator vault account mismatch");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    validate_token_account(percolator_vault, collateral_mint, &expected_vault_authority)
+}
+
 /// Mint COIN tokens via PDA authority.
 fn mint_coin<'a>(
     token_program: &AccountInfo<'a>,
@@ -517,18 +579,12 @@ fn process_init_market_rewards<'a>(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Verify slab is initialized and admin is burned.
-    let slab_data = market_slab.try_borrow_data()?;
-    let header = state::read_header(&slab_data);
-    if header.magic == 0 {
-        msg!("Slab not initialized (magic = 0)");
-        return Err(ProgramError::InvalidAccountData);
-    }
+    // Verify slab is a real Percolator market for this collateral and admin is burned.
+    let (header, _market_cfg) = load_percolator_market(market_slab, collateral_mint.key)?;
     if header.admin != [0u8; 32] {
         msg!("Percolator market admin must be burned before rewards init");
         return Err(ProgramError::InvalidAccountData);
     }
-    drop(slab_data);
     // Use current clock slot as the market start for reward tracking
     let clock_for_init = Clock::get()?;
     let market_start_slot = clock_for_init.slot;
@@ -1144,21 +1200,35 @@ fn process_pull_insurance<'a>(
     if !payer.is_signer { return Err(ProgramError::MissingRequiredSignature); }
 
     verify_token_program(token_program)?;
+    verify_percolator_program(percolator_program)?;
 
     // Verify MRC PDA & derive seeds
-    let mrc_data = mrc_account_data_ref(mrc_pda_account, program_id, market_slab.key)?;
+    let mrc_data = mrc_account_data_ref(mrc_pda_account, program_id)?;
     let cfg = MarketRewardsCfg::deserialize(&mrc_data)?;
     drop(mrc_data);
+    if *market_slab.key != cfg.market_slab {
+        msg!("MRC slab does not match passed market slab");
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     let (expected_mrc, mrc_bump) = Pubkey::find_program_address(
         &mrc_seeds(&cfg.market_slab), program_id);
     if *mrc_pda_account.key != expected_mrc { return Err(ProgramError::InvalidSeeds); }
+
+    let (_header, market_cfg) = load_percolator_market(market_slab, &cfg.collateral_mint)?;
 
     // Verify stake_vault PDA (destination for the CPI)
     let (expected_vault, _) = Pubkey::find_program_address(
         &stake_vault_seeds(&cfg.market_slab), program_id);
     if *stake_vault.key != expected_vault { return Err(ProgramError::InvalidSeeds); }
     validate_token_account(stake_vault, &cfg.collateral_mint, mrc_pda_account.key)?;
+    validate_percolator_vault_accounts(
+        market_slab,
+        percolator_vault,
+        percolator_vault_pda,
+        &market_cfg,
+        &cfg.collateral_mint,
+    )?;
 
     // Build WithdrawInsuranceLimited(amount) — tag 23.
     // Accounts: [operator, slab, operator_ata, vault, token_program, vault_pda, clock]
@@ -1198,11 +1268,10 @@ fn process_pull_insurance<'a>(
     )
 }
 
-/// Helper: borrow MRC data and verify the account is a valid MRC PDA for the given slab.
+/// Helper: borrow MRC data and verify account ownership/discriminator.
 fn mrc_account_data_ref<'a>(
     mrc_account: &'a AccountInfo,
     program_id: &Pubkey,
-    _market_slab: &Pubkey,
 ) -> Result<core::cell::Ref<'a, &'a mut [u8]>, ProgramError> {
     if mrc_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
