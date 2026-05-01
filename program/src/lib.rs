@@ -52,6 +52,9 @@ const IX_REGISTER_INSURANCE_OPERATOR: u8 = 6;
 /// facing instructions and draw_insurance can redistribute the pulled
 /// funds.
 const IX_PULL_INSURANCE: u8 = 7;
+const IX_MINT_REWARD: u8 = 8;
+const IX_SET_MARKET_REWARDS: u8 = 9;
+const IX_TRANSFER_MINT_AUTHORITY: u8 = 10;
 
 /// Percolator instruction tags we CPI into
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
@@ -453,6 +456,9 @@ pub fn process_instruction<'a>(
         IX_DRAW_INSURANCE => process_draw_insurance(program_id, accounts, &mut data),
         IX_REGISTER_INSURANCE_OPERATOR => process_register_insurance_operator(program_id, accounts),
         IX_PULL_INSURANCE => process_pull_insurance(program_id, accounts, &mut data),
+        IX_MINT_REWARD => process_mint_reward(program_id, accounts, &mut data),
+        IX_SET_MARKET_REWARDS => process_set_market_rewards(program_id, accounts, &mut data),
+        IX_TRANSFER_MINT_AUTHORITY => process_transfer_mint_authority(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -987,6 +993,168 @@ fn process_claim_stake_rewards<'a>(
     pos.serialize(&mut sp_data);
 
     Ok(())
+}
+
+// ============================================================================
+// mint_reward, set_market_rewards, transfer_mint_authority
+// ============================================================================
+
+fn process_mint_reward<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &mut &[u8],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg_account = next_account_info(iter)?;
+    let destination = next_account_info(iter)?;
+    let mint_authority = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    let amount = read_u64(data)?;
+    if amount == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    verify_token_program(token_program)?;
+    validate_governance_authority(authority, coin_mint.key, program_id)?;
+
+    let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
+    if *authority.key != coin_cfg.authority {
+        msg!("Signer does not match CoinConfig authority");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let dest_token = load_token_account(destination)?;
+    if dest_token.mint != *coin_mint.key {
+        msg!("Destination mint mismatch");
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let ma_seeds = mint_authority_seeds(coin_mint.key);
+    let (expected_ma, ma_bump) = Pubkey::find_program_address(&ma_seeds, program_id);
+    if *mint_authority.key != expected_ma {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let bump_bytes = [ma_bump];
+    let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", coin_mint.key.as_ref(), &bump_bytes];
+
+    mint_coin(
+        token_program,
+        coin_mint,
+        destination,
+        mint_authority,
+        amount,
+        &signer_seeds,
+    )
+}
+
+fn process_set_market_rewards<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &mut &[u8],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let mrc_account = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg_account = next_account_info(iter)?;
+    let clock_sysvar = next_account_info(iter)?;
+
+    let new_n_per_epoch = read_u64(data)?;
+    let new_epoch_slots = read_u64(data)?;
+    if new_epoch_slots == 0 {
+        msg!("epoch_slots must be > 0");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    validate_governance_authority(authority, coin_mint.key, program_id)?;
+    let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
+    if *authority.key != coin_cfg.authority {
+        msg!("Signer does not match CoinConfig authority");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if mrc_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    let mut mrc_data = mrc_account.try_borrow_mut_data()?;
+    let mut cfg = MarketRewardsCfg::deserialize(&mrc_data)?;
+    let (expected_mrc, _) = Pubkey::find_program_address(&mrc_seeds(&cfg.market_slab), program_id);
+    if *mrc_account.key != expected_mrc {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if *coin_mint.key != cfg.coin_mint {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let clock = Clock::from_account_info(clock_sysvar)?;
+    update_accumulator(&mut cfg, clock.slot);
+    cfg.n_per_epoch = new_n_per_epoch;
+    cfg.epoch_slots = new_epoch_slots;
+    cfg.serialize(&mut mrc_data);
+    Ok(())
+}
+
+fn process_transfer_mint_authority<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg_account = next_account_info(iter)?;
+    let mint_authority = next_account_info(iter)?;
+    let new_authority = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    verify_token_program(token_program)?;
+    validate_governance_authority(authority, coin_mint.key, program_id)?;
+
+    let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
+    if *authority.key != coin_cfg.authority {
+        msg!("Signer does not match CoinConfig authority");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let ma_seeds = mint_authority_seeds(coin_mint.key);
+    let (expected_ma, ma_bump) = Pubkey::find_program_address(&ma_seeds, program_id);
+    if *mint_authority.key != expected_ma {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let bump_bytes = [ma_bump];
+    let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", coin_mint.key.as_ref(), &bump_bytes];
+
+    let ix = spl_token::instruction::set_authority(
+        token_program.key,
+        coin_mint.key,
+        Some(new_authority.key),
+        spl_token::instruction::AuthorityType::MintTokens,
+        mint_authority.key,
+        &[],
+    )?;
+    invoke_signed(
+        &ix,
+        &[
+            coin_mint.clone(),
+            mint_authority.clone(),
+            token_program.clone(),
+        ],
+        &[&signer_seeds],
+    )
 }
 
 // ============================================================================

@@ -30,6 +30,9 @@ const IX_INIT_AUTHORITY: u8 = 0;
 const IX_INIT_COIN_CONFIG: u8 = 1;
 const IX_INIT_MARKET_REWARDS: u8 = 2;
 const IX_DRAW_INSURANCE: u8 = 3;
+const IX_MINT_REWARD: u8 = 4;
+const IX_SET_MARKET_REWARDS: u8 = 5;
+const IX_TRANSFER_MINT_AUTHORITY: u8 = 6;
 
 const AUTHORITY_DISC: [u8; 8] = *b"GAUTH001";
 const AUTHORITY_SIZE: usize = 8 + 32;
@@ -164,6 +167,9 @@ pub fn process_instruction<'a>(
         IX_INIT_COIN_CONFIG => process_init_coin_config(program_id, accounts),
         IX_INIT_MARKET_REWARDS => process_init_market_rewards(program_id, accounts, &mut data),
         IX_DRAW_INSURANCE => process_draw_insurance(program_id, accounts, &mut data),
+        IX_MINT_REWARD => process_mint_reward(program_id, accounts, &mut data),
+        IX_SET_MARKET_REWARDS => process_set_market_rewards(program_id, accounts, &mut data),
+        IX_TRANSFER_MINT_AUTHORITY => process_transfer_mint_authority(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -401,6 +407,174 @@ fn process_draw_insurance<'a>(
             destination.clone(),
             coin_mint.clone(),
             coin_cfg.clone(),
+            token_program.clone(),
+            rewards_program.clone(),
+        ],
+        &[&signer_seeds],
+    )
+}
+
+fn process_mint_reward<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &mut &[u8],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let rewards_program = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg = next_account_info(iter)?;
+    let destination = next_account_info(iter)?;
+    let mint_authority = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let amount = read_u64(data)?;
+    let (bump, cfg) = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
+    require_controller(payer, &cfg.controller)?;
+    let bump_bytes = [bump];
+    let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
+
+    let mut ix_data = Vec::with_capacity(9);
+    ix_data.push(8u8);
+    ix_data.extend_from_slice(&amount.to_le_bytes());
+    let ix = Instruction {
+        program_id: *rewards_program.key,
+        accounts: vec![
+            AccountMeta::new(*payer.key, true),
+            AccountMeta::new_readonly(*authority.key, true),
+            AccountMeta::new(*coin_mint.key, false),
+            AccountMeta::new_readonly(*coin_cfg.key, false),
+            AccountMeta::new(*destination.key, false),
+            AccountMeta::new_readonly(*mint_authority.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+        ],
+        data: ix_data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[
+            payer.clone(),
+            authority.clone(),
+            coin_mint.clone(),
+            coin_cfg.clone(),
+            destination.clone(),
+            mint_authority.clone(),
+            token_program.clone(),
+            rewards_program.clone(),
+        ],
+        &[&signer_seeds],
+    )
+}
+
+fn process_set_market_rewards<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &mut &[u8],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let rewards_program = next_account_info(iter)?;
+    let mrc = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg = next_account_info(iter)?;
+    let clock_sysvar = next_account_info(iter)?;
+
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let new_n_per_epoch = read_u64(data)?;
+    let new_epoch_slots = read_u64(data)?;
+    let (bump, cfg) = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
+    require_controller(payer, &cfg.controller)?;
+    let bump_bytes = [bump];
+    let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
+
+    let mut ix_data = Vec::with_capacity(17);
+    ix_data.push(9u8);
+    ix_data.extend_from_slice(&new_n_per_epoch.to_le_bytes());
+    ix_data.extend_from_slice(&new_epoch_slots.to_le_bytes());
+    let ix = Instruction {
+        program_id: *rewards_program.key,
+        accounts: vec![
+            AccountMeta::new(*payer.key, true),
+            AccountMeta::new_readonly(*authority.key, true),
+            AccountMeta::new(*mrc.key, false),
+            AccountMeta::new_readonly(*coin_mint.key, false),
+            AccountMeta::new_readonly(*coin_cfg.key, false),
+            AccountMeta::new_readonly(*clock_sysvar.key, false),
+        ],
+        data: ix_data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[
+            payer.clone(),
+            authority.clone(),
+            mrc.clone(),
+            coin_mint.clone(),
+            coin_cfg.clone(),
+            clock_sysvar.clone(),
+            rewards_program.clone(),
+        ],
+        &[&signer_seeds],
+    )
+}
+
+fn process_transfer_mint_authority<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let rewards_program = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg = next_account_info(iter)?;
+    let mint_authority = next_account_info(iter)?;
+    let new_authority = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let (bump, cfg) = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
+    require_controller(payer, &cfg.controller)?;
+    let bump_bytes = [bump];
+    let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
+
+    let ix = Instruction {
+        program_id: *rewards_program.key,
+        accounts: vec![
+            AccountMeta::new(*payer.key, true),
+            AccountMeta::new_readonly(*authority.key, true),
+            AccountMeta::new(*coin_mint.key, false),
+            AccountMeta::new_readonly(*coin_cfg.key, false),
+            AccountMeta::new_readonly(*mint_authority.key, false),
+            AccountMeta::new_readonly(*new_authority.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+        ],
+        data: vec![10u8],
+    };
+
+    invoke_signed(
+        &ix,
+        &[
+            payer.clone(),
+            authority.clone(),
+            coin_mint.clone(),
+            coin_cfg.clone(),
+            mint_authority.clone(),
+            new_authority.clone(),
             token_program.clone(),
             rewards_program.clone(),
         ],
