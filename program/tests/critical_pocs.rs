@@ -148,6 +148,38 @@ fn try_init_governance_authority(
         .map_err(|e| format!("{:?}", e))
 }
 
+fn try_init_governance_authority_with_controller(
+    svm: &mut LiteSVM,
+    governance_id: Pubkey,
+    payer: &Keypair,
+    controller: &Keypair,
+    authority_pda: Pubkey,
+    rewards_id: Pubkey,
+    coin_mint: Pubkey,
+) -> Result<(), String> {
+    let ix = Instruction {
+        program_id: governance_id,
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(authority_pda, false),
+            AccountMeta::new_readonly(rewards_id, false),
+            AccountMeta::new_readonly(coin_mint, false),
+            AccountMeta::new_readonly(controller.pubkey(), true),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_governance_init_authority(),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer, controller],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+}
+
 fn encode_stake(amount: u64) -> Vec<u8> {
     let mut data = vec![1u8];
     data.extend_from_slice(&amount.to_le_bytes());
@@ -538,6 +570,56 @@ fn test_f1_first_mover_init_authority_requires_current_mint_authority() {
     assert!(
         svm.get_account(&authority_pda).is_none(),
         "authority PDA must remain uninitialized"
+    );
+}
+
+#[test]
+fn test_init_authority_allows_separate_rent_payer_and_controller() {
+    let mut svm = LiteSVM::new();
+
+    let rewards_id = Pubkey::new_unique();
+    let governance_id = governance_program_id();
+    let governance_bytes = std::fs::read(governance_path()).expect("read governance BPF");
+    svm.add_program(governance_id, &governance_bytes);
+
+    let payer = Keypair::new();
+    let controller = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+    svm.airdrop(&controller.pubkey(), 1_000_000).unwrap();
+
+    let coin_mint = Pubkey::new_unique();
+    svm.set_account(
+        coin_mint,
+        Account {
+            lamports: 1_000_000,
+            data: make_mint_data_with_authority(&controller.pubkey()),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    let (authority_pda, _) = governance_authority_address(&rewards_id, &coin_mint);
+    try_init_governance_authority_with_controller(
+        &mut svm,
+        governance_id,
+        &payer,
+        &controller,
+        authority_pda,
+        rewards_id,
+        coin_mint,
+    )
+    .expect("separate payer/controller init_authority failed");
+
+    let authority = svm
+        .get_account(&authority_pda)
+        .expect("authority PDA should be initialized");
+    assert_eq!(authority.owner, governance_id);
+    assert_eq!(&authority.data[..8], b"GAUTH001");
+    assert_eq!(
+        Pubkey::new_from_array(authority.data[8..40].try_into().unwrap()),
+        controller.pubkey()
     );
 }
 

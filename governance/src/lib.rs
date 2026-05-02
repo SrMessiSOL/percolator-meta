@@ -133,6 +133,16 @@ fn require_controller(controller: &AccountInfo, expected: &Pubkey) -> ProgramRes
     Ok(())
 }
 
+fn optional_controller_or_payer<'a, I>(
+    iter: &mut I,
+    payer: &'a AccountInfo<'a>,
+) -> &'a AccountInfo<'a>
+where
+    I: Iterator<Item = &'a AccountInfo<'a>>,
+{
+    iter.next().unwrap_or(payer)
+}
+
 fn verify_mint_controller(controller: &AccountInfo, coin_mint: &AccountInfo) -> ProgramResult {
     if coin_mint.owner != &spl_token::ID {
         msg!("COIN mint must be owned by SPL Token program");
@@ -183,7 +193,13 @@ fn process_init_authority<'a>(
     let authority = next_account_info(iter)?;
     let rewards_program = next_account_info(iter)?;
     let coin_mint = next_account_info(iter)?;
-    let system_program = next_account_info(iter)?;
+    let maybe_controller_or_system = next_account_info(iter)?;
+    let (controller, system_program) =
+        if *maybe_controller_or_system.key == solana_program::system_program::ID {
+            (payer, maybe_controller_or_system)
+        } else {
+            (maybe_controller_or_system, next_account_info(iter)?)
+        };
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -203,11 +219,11 @@ fn process_init_authority<'a>(
         }
         let cfg_data = authority.try_borrow_data()?;
         let cfg = AuthorityConfig::deserialize(&cfg_data)?;
-        require_controller(payer, &cfg.controller)?;
+        require_controller(controller, &cfg.controller)?;
         return Ok(());
     }
 
-    verify_mint_controller(payer, coin_mint)?;
+    verify_mint_controller(controller, coin_mint)?;
 
     let bump_bytes = [bump];
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
@@ -226,7 +242,7 @@ fn process_init_authority<'a>(
 
     let mut data = authority.try_borrow_mut_data()?;
     let cfg = AuthorityConfig {
-        controller: *payer.key,
+        controller: *controller.key,
     };
     cfg.serialize(&mut data);
     Ok(())
@@ -243,13 +259,14 @@ fn process_init_coin_config<'a>(
     let coin_mint = next_account_info(iter)?;
     let coin_cfg = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
+    let controller = optional_controller_or_payer(iter, payer);
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
     let (bump, cfg) = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
-    require_controller(payer, &cfg.controller)?;
+    require_controller(controller, &cfg.controller)?;
     let bump_bytes = [bump];
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
     let ix = Instruction {
@@ -296,6 +313,7 @@ fn process_init_market_rewards<'a>(
     let token_program = next_account_info(iter)?;
     let rent_sysvar = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
+    let controller = optional_controller_or_payer(iter, payer);
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -304,7 +322,7 @@ fn process_init_market_rewards<'a>(
     let n_per_epoch = read_u64(data)?;
     let epoch_slots = read_u64(data)?;
     let (bump, cfg) = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
-    require_controller(payer, &cfg.controller)?;
+    require_controller(controller, &cfg.controller)?;
     let bump_bytes = [bump];
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
 
@@ -366,6 +384,7 @@ fn process_draw_insurance<'a>(
     let coin_mint = next_account_info(iter)?;
     let coin_cfg = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let controller = optional_controller_or_payer(iter, payer);
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -373,7 +392,7 @@ fn process_draw_insurance<'a>(
 
     let amount = read_u64(data)?;
     let (bump, cfg) = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
-    require_controller(payer, &cfg.controller)?;
+    require_controller(controller, &cfg.controller)?;
     let bump_bytes = [bump];
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
 
@@ -428,6 +447,7 @@ fn process_mint_reward<'a>(
     let destination = next_account_info(iter)?;
     let mint_authority = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let controller = optional_controller_or_payer(iter, payer);
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -435,7 +455,7 @@ fn process_mint_reward<'a>(
 
     let amount = read_u64(data)?;
     let (bump, cfg) = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
-    require_controller(payer, &cfg.controller)?;
+    require_controller(controller, &cfg.controller)?;
     let bump_bytes = [bump];
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
 
@@ -485,6 +505,7 @@ fn process_set_market_rewards<'a>(
     let coin_mint = next_account_info(iter)?;
     let coin_cfg = next_account_info(iter)?;
     let clock_sysvar = next_account_info(iter)?;
+    let controller = optional_controller_or_payer(iter, payer);
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -493,7 +514,7 @@ fn process_set_market_rewards<'a>(
     let new_n_per_epoch = read_u64(data)?;
     let new_epoch_slots = read_u64(data)?;
     let (bump, cfg) = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
-    require_controller(payer, &cfg.controller)?;
+    require_controller(controller, &cfg.controller)?;
     let bump_bytes = [bump];
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
 
@@ -542,13 +563,14 @@ fn process_transfer_mint_authority<'a>(
     let mint_authority = next_account_info(iter)?;
     let new_authority = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let controller = optional_controller_or_payer(iter, payer);
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
     let (bump, cfg) = verify_authority(program_id, authority, rewards_program.key, coin_mint.key)?;
-    require_controller(payer, &cfg.controller)?;
+    require_controller(controller, &cfg.controller)?;
     let bump_bytes = [bump];
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
 
